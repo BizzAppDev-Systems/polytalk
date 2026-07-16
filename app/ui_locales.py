@@ -11,6 +11,7 @@ SUPPORTED_UI_LOCALE_CODES = {
     "es",
     "fi",
     "fr",
+    "hi",
     "it",
     "nl",
     "pl",
@@ -33,4 +34,5 @@ UI_LOCALE_NATIVE_NAMES = {
     "pt": "Português",
     "ro": "Română",
     "sv": "Svenska",
+    "hi": "हिन्दी",
 }
