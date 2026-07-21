@@ -28,11 +28,11 @@ UI_LOCALE_NATIVE_NAMES = {
     "es": "Español",
     "fi": "Suomi",
     "fr": "Français",
+    "hi": "हिन्दी",
     "it": "Italiano",
     "nl": "Nederlands",
     "pl": "Polski",
     "pt": "Português",
     "ro": "Română",
     "sv": "Svenska",
-    "hi": "हिन्दी",
 }
