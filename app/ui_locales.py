@@ -12,12 +12,12 @@ SUPPORTED_UI_LOCALE_CODES = {
     "fi",
     "fr",
     "it",
-    "zh",
     "nl",
     "pl",
     "pt",
     "ro",
     "sv",
+    "zh",
 }
 
 UI_LOCALE_NATIVE_NAMES = {
