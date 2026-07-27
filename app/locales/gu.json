@@ -164,7 +164,7 @@
     "Translated Voice Output": "અનુવાદિત વૉઇસ આઉટપુટ",
     "Translated speech will appear here instantly.": "અનુવાદિત વાણી અહીં તરત જ દેખાશે.",
     "Turkish": "તુર્કિશ",
-    "UI Language": "UI ભાષા",
+    "UI Language": "વપરાશકર્તા ઇન્ટરફેસ ભાષા",
     "Ukrainian": "યુક્રેનિયન",
     "User cancelled screen sharing": "વપરાશકર્તાએ સ્ક્રીન શેરિંગ રદ કર્યું છે",
     "Vietnamese": "વિયેતનામીઝ",
@@ -172,7 +172,7 @@
     "Your browser does not support tab audio sharing.": "તમારું બ્રાઉઝર ટેબ ઓડિયો શેરિંગ સપોર્ટ કરતું નથી.",
     "Your browser does not support the audio element.": "તમારું બ્રાઉઝર ઓડિયો એલિમેન્ટ સપોર્ટ કરતું નથી.",
     "getUserMedia is not supported in this browser.": "getUserMedia આ બ્રાઉઝરમાં સપોર્ટેડ નથી.",
-    "AI Behavior": "AI વર્તન",
+    "AI Behavior": "કૃત્રિમ બુદ્ધિમત્તા વર્તન",
     "Translation Instructions": "અનુવાદ સૂચનાઓ",
     "Translate formally. Keep technical terms in English.": "ઔપચારિક રીતે અનુવાદ કરો. તકનીકી શબ્દો અંગ્રેજીમાં જ રાખો.",
     "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "લાઇવ, વાતચીત અને ટૅબ-ઑડિયો અનુવાદ સત્રો સાથે મોકલવામાં આવતી વૈકલ્પિક માર્ગદર્શિકા."
@@ -185,5 +185,5 @@
   "js.microphone_number": "માઇક્રોફોન {number}",
   "js.output_device_changed": "આઉટપુટ ઉપકરણ બદલાયો: {device}",
   "js.speaker_number": "સ્પીકર {number}",
-  "settings.ui_language": "UI ભાષા"
+  "settings.ui_language": "વપરાશકર્તા ઇન્ટરફેસ ભાષા"
 }
