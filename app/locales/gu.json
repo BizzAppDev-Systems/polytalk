@@ -178,7 +178,7 @@
     "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "લાઇવ, વાતચીત અને ટૅબ-ઑડિયો અનુવાદ સત્રો સાથે મોકલવામાં આવતી વૈકલ્પિક માર્ગદર્શિકા."
   },
   "app.title": "PolyTalk - પ્રાઇવસી-પ્રથમ સેલ્ફ-હોસ્ટેડ અનુવાદ",
-  "js.error_message": " ભૂલ: {error}",
+  "js.error_message": "ભૂલ: {error}",
   "js.failed_share_tab_audio": "ટેબ ઓડિયો શેર કરવામાં અસફળ: {error}",
   "js.microphone_access_failed": "માઇક્રોફોન એક્સેસ અસફળ: {name} - {message}",
   "js.microphone_changed": "માઇક્રોફોન બદલાયો: {device}",
