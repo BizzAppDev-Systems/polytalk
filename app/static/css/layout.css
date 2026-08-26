@@ -146,6 +146,16 @@ header {
     transition: border-color 0.2s;
 }
 
+.settings-field input[type="range"] {
+    width: 100%;
+    accent-color: var(--poly-primary);
+}
+
+.settings-field input[type="range"]:focus {
+    outline: 2px solid rgba(255, 122, 24, 0.44);
+    outline-offset: 4px;
+}
+
 .settings-field select {
     cursor: pointer;
 }
@@ -177,6 +187,10 @@ header {
     color: #a0a0a0;
     margin-top: 8px;
     font-style: italic;
+}
+
+.settings-warning {
+    color: #f0bd84;
 }
 
 .settings-footer {

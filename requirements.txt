@@ -20,5 +20,9 @@ websockets>=12.0
 pyyaml>=6.0.1
 python-dotenv>=1.0.0
 
+# Shared voice activity detection
+numpy>=1.26.0
+onnxruntime>=1.17.0,<2.0
+
 # Type checking (optional but recommended)
 pydantic>=2.5.0

@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from app.services.tts_service import TTSService
+from app.utils.sanitize import normalize_tts_text
 
 
 class TestTTSServiceInit:
@@ -850,6 +851,183 @@ class TestTTSVoiceSelection:
             with patch.object(service._http_client, "post", return_value=mock_response):
                 result = await service.synthesize("Hello", "en")
                 assert result.success is False
+
+
+class TestNormalizeTTS:
+    """Test normalize_tts_text utility function."""
+
+    def test_normalize_tts_no_change_for_ascii(self):
+        """Text with only ASCII characters should remain unchanged."""
+        assert normalize_tts_text("Hello World") == "Hello World"
+        assert normalize_tts_text("123 abc") == "123 abc"
+        assert (
+            normalize_tts_text("now some of your parents") == "now some of your parents"
+        )
+
+    def test_normalize_tts_devanagari_digits(self):
+        """Devanagari digits (Hindi, Marathi) should be converted to ASCII."""
+        assert normalize_tts_text("कीमत ० रुपये") == "कीमत 0 रुपये"
+        assert normalize_tts_text("संख्या १२३") == "संख्या 123"
+        assert normalize_tts_text("अंक ०१२३४५६७८९") == "अंक 0123456789"
+
+    def test_normalize_tts_gujarati_digits(self):
+        """Gujarati digits should be converted to ASCII."""
+        assert normalize_tts_text("કિંમત ૦") == "કિંમત 0"
+        assert normalize_tts_text("અંક ૦૧૨૩૪૫૬૭૮૯") == "અંક 0123456789"
+
+    def test_normalize_tts_bengali_digits(self):
+        """Bengali digits should be converted to ASCII."""
+        assert normalize_tts_text("মূল্য ০") == "মূল্য 0"
+        assert normalize_tts_text("০১২৩৪৫৬৭৮৯") == "0123456789"
+
+    def test_normalize_tts_gurmukhi_digits(self):
+        """Gurmukhi digits should be converted to ASCII."""
+        assert normalize_tts_text("ਕੀਮਤ ੦") == "ਕੀਮਤ 0"
+        assert normalize_tts_text("੦੧੨੩੪੫੬੭੮੯") == "0123456789"
+
+    def test_normalize_tts_arabic_indic_digits(self):
+        """Arabic-Indic digits should be converted to ASCII."""
+        assert normalize_tts_text("٠١٢٣٤٥٦٧٨٩") == "0123456789"
+
+    def test_normalize_tts_extended_arabic_indic_digits(self):
+        """Extended Arabic-Indic digits should be converted to ASCII."""
+        assert normalize_tts_text("۰۱۲۳۴۵۶۷۸۹") == "0123456789"
+
+    def test_normalize_tts_myanmar_digits(self):
+        """Myanmar digits should be converted to ASCII."""
+        assert normalize_tts_text("၀၁၂၃၄၅၆၇၈၉") == "0123456789"
+
+    def test_normalize_tts_thai_digits(self):
+        """Thai digits should be converted to ASCII."""
+        assert normalize_tts_text("๐๑๒๓๔๕๖๗๘๙") == "0123456789"
+
+    def test_normalize_tts_lao_digits(self):
+        """Lao digits should be converted to ASCII."""
+        assert normalize_tts_text("໐໑໒໓໔໕໖໗໘໙") == "0123456789"
+
+    def test_normalize_tts_tibetan_digits(self):
+        """Tibetan digits should be converted to ASCII."""
+        assert normalize_tts_text("༠༡༢༣༤༥༦༧༨༩") == "0123456789"
+
+    def test_normalize_tts_khmer_digits(self):
+        """Khmer digits should be converted to ASCII."""
+        assert normalize_tts_text("០១២៣៤៥៦៧៨៩") == "0123456789"
+
+    def test_normalize_tts_mixed_content(self):
+        """Mixed ASCII and non-ASCII digits should be handled correctly."""
+        assert normalize_tts_text("Price is ० and 100") == "Price is 0 and 100"
+        assert normalize_tts_text("०५० and 123") == "050 and 123"
+        assert normalize_tts_text("०१२३ and 456 and 789") == "0123 and 456 and 789"
+
+    def test_normalize_tts_empty_string(self):
+        """Empty string should return empty string."""
+        assert normalize_tts_text("") == ""
+
+    def test_normalize_tts_no_digits(self):
+        """Text without any digits should return unchanged."""
+        assert normalize_tts_text("Hello World!") == "Hello World!"
+        assert normalize_tts_text("日本語テスト") == "日本語テスト"
+        assert normalize_tts_text("Привет мир") == "Привет мир"
+
+
+class TestSupertonicDigitNormalization:
+    """Test that Supertonic synthesis normalizes non-Latin digits."""
+
+    @pytest.mark.asyncio
+    async def test_supertonic_normalizes_devanagari_digits(self, tmp_path):
+        """Devanagari digits in Hindi text should be normalized for Supertonic."""
+        with patch("app.services.tts_service.get_config") as mock_config:
+            mock_config.return_value.tts = {
+                "enabled": True,
+                "mock_mode": False,
+                "provider": "piper",
+                "base_url": "http://piper:5000",
+                "timeout_seconds": 10,
+                "language_providers": {"hi": "supertonic"},
+                "providers": {
+                    "supertonic": {
+                        "base_url": "http://supertonic-tts:7788",
+                        "voice": "M1",
+                        "steps": 8,
+                        "speed": 1.05,
+                        "response_format": "wav",
+                    }
+                },
+            }
+            mock_config.return_value.app = {}
+            mock_config.return_value.media_output_dir = tmp_path
+            service = TTSService()
+
+            response = httpx.Response(
+                200,
+                content=b"RIFFtest",
+                headers={"X-Audio-Duration": "1.0"},
+                request=httpx.Request("POST", "http://supertonic-tts:7788/v1/tts"),
+            )
+
+            class MockStream:
+                async def __aenter__(self):
+                    return response
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    return None
+
+            service._http_client.stream = MagicMock(return_value=MockStream())
+
+            result = await service.synthesize("रुपये ०", "hi-IN", tmp_path / "hi.wav")
+
+            assert result.success is True
+            call_args = service._http_client.stream.call_args
+            assert call_args[1]["json"]["text"] == "रुपये 0"
+
+    @pytest.mark.asyncio
+    async def test_supertonic_preserves_meaning_with_numbers(self, tmp_path):
+        """Normalized digits should not change the numeric meaning."""
+        with patch("app.services.tts_service.get_config") as mock_config:
+            mock_config.return_value.tts = {
+                "enabled": True,
+                "mock_mode": False,
+                "provider": "piper",
+                "base_url": "http://piper:5000",
+                "timeout_seconds": 10,
+                "language_providers": {"hi": "supertonic"},
+                "providers": {
+                    "supertonic": {
+                        "base_url": "http://supertonic-tts:7788",
+                        "voice": "M1",
+                        "steps": 8,
+                        "speed": 1.05,
+                        "response_format": "wav",
+                    }
+                },
+            }
+            mock_config.return_value.app = {}
+            mock_config.return_value.media_output_dir = tmp_path
+            service = TTSService()
+
+            response = httpx.Response(
+                200,
+                content=b"RIFFtest",
+                headers={"X-Audio-Duration": "1.0"},
+                request=httpx.Request("POST", "http://supertonic-tts:7788/v1/tts"),
+            )
+
+            class MockStream:
+                async def __aenter__(self):
+                    return response
+
+                async def __aexit__(self, exc_type, exc, traceback):
+                    return None
+
+            service._http_client.stream = MagicMock(return_value=MockStream())
+
+            result = await service.synthesize(
+                "संख्या ०१२३४५६७८९", "hi-IN", tmp_path / "hi.wav"
+            )
+
+            assert result.success is True
+            call_args = service._http_client.stream.call_args
+            assert call_args[1]["json"]["text"] == "संख्या 0123456789"
 
     @pytest.mark.asyncio
     async def test_synthesize_with_http_error(self):

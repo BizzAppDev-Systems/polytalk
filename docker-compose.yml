@@ -24,12 +24,15 @@ services:
       - STT_PRELOAD_MODEL=${STT_PRELOAD_MODEL:-true}
       - STT_EMIT_MIN_CHARS=${STT_EMIT_MIN_CHARS:-40}
       - STT_EMIT_INTERVAL_SECONDS=${STT_EMIT_INTERVAL_SECONDS:-2.0}
-      - STT_PAUSE_FLUSH_SECONDS=${STT_PAUSE_FLUSH_SECONDS:-1.0}
+      - STT_PAUSE_FLUSH_SECONDS=${STT_PAUSE_FLUSH_SECONDS:-2.0}
       - STT_IDLE_FLUSH_SECONDS=${STT_IDLE_FLUSH_SECONDS:-3.0}
       - STT_LEADING_SILENCE_PREROLL_SECONDS=${STT_LEADING_SILENCE_PREROLL_SECONDS:-0.2}
       - STT_SILENCE_RMS_THRESHOLD=${STT_SILENCE_RMS_THRESHOLD:-0.003}
       - STT_NO_SPEECH_PROB_THRESHOLD=${STT_NO_SPEECH_PROB_THRESHOLD:-0.50}
       - STT_LOG_PROB_THRESHOLD=${STT_LOG_PROB_THRESHOLD:--1.0}
+      - STT_CANDIDATE_LANGUAGE_CONFIDENCE=${STT_CANDIDATE_LANGUAGE_CONFIDENCE:-0.70}
+      - STT_MAX_CANDIDATE_DECODES=${STT_MAX_CANDIDATE_DECODES:-3}
+      - STT_CANDIDATE_SCRIPT_SCORE_WEIGHT=${STT_CANDIDATE_SCRIPT_SCORE_WEIGHT:-1.50}
       - STT_MAX_CROSS_DELTA_WORD_REPEATS=${STT_MAX_CROSS_DELTA_WORD_REPEATS:-6}
       - STT_VAD_FILTER=${STT_VAD_FILTER:-true}
       - STT_VAD_MIN_SILENCE_MS=${STT_VAD_MIN_SILENCE_MS:-500}
@@ -54,6 +57,91 @@ services:
 #           - driver: nvidia
 #             count: 1
 #             capabilities: [gpu]
+
+  indicconformer-stt:
+    build:
+      context: ./stt_providers
+      dockerfile: Dockerfile
+      args:
+        STT_PROVIDER: indicconformer
+        STT_PROVIDER_MODEL: ${INDIC_STT_MODEL:-ai4bharat/indic-conformer-600m-multilingual}
+      secrets:
+        - hf_token
+    image: polytalk-indicconformer-stt:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8011:8000"
+    environment:
+      - STT_PROVIDER=indicconformer
+      - STT_PROVIDER_MODEL=${INDIC_STT_MODEL:-ai4bharat/indic-conformer-600m-multilingual}
+      - STT_DEVICE=${SPECIALIZED_STT_DEVICE:-cpu}
+      - STT_PRELOAD_MODEL=${STT_PRELOAD_MODEL:-true}
+      - STT_STREAM_CHUNK_SECONDS=${STT_STREAM_CHUNK_SECONDS:-3.0}
+      - STT_WARMUP_RUNS=${INDIC_STT_WARMUP_RUNS:-2}
+      - STT_WARMUP_SECONDS=${INDIC_STT_WARMUP_SECONDS:-6.0}
+      - STT_EMIT_PARTIALS=${SPECIALIZED_STT_EMIT_PARTIALS:-false}
+      - STT_PAUSE_FLUSH_SECONDS=${STT_PAUSE_FLUSH_SECONDS:-2.0}
+      - STT_SILENCE_RMS_THRESHOLD=${STT_SILENCE_RMS_THRESHOLD:-0.003}
+      - STT_MAX_UTTERANCE_SECONDS=${STT_MAX_UTTERANCE_SECONDS:-30.0}
+    volumes:
+      # Mount shared specialized STT source for local development.
+      - ./stt_providers/app:/app/app:ro
+    networks:
+      - polytalk-network
+
+  parakeet-stt:
+    build:
+      context: ./stt_providers
+      dockerfile: Dockerfile
+      args:
+        STT_PROVIDER: parakeet
+        STT_PROVIDER_MODEL: ${PARAKEET_STT_MODEL:-nvidia/parakeet-tdt-0.6b-v3}
+    image: polytalk-parakeet-stt:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8012:8000"
+    environment:
+      - STT_PROVIDER=parakeet
+      - STT_PROVIDER_MODEL=${PARAKEET_STT_MODEL:-nvidia/parakeet-tdt-0.6b-v3}
+      - STT_DEVICE=${SPECIALIZED_STT_DEVICE:-cpu}
+      - STT_PRELOAD_MODEL=${STT_PRELOAD_MODEL:-true}
+      - STT_STREAM_CHUNK_SECONDS=${STT_STREAM_CHUNK_SECONDS:-3.0}
+      - STT_EMIT_PARTIALS=${SPECIALIZED_STT_EMIT_PARTIALS:-false}
+      - STT_PAUSE_FLUSH_SECONDS=${STT_PAUSE_FLUSH_SECONDS:-2.0}
+      - STT_SILENCE_RMS_THRESHOLD=${STT_SILENCE_RMS_THRESHOLD:-0.003}
+      - STT_MAX_UTTERANCE_SECONDS=${STT_MAX_UTTERANCE_SECONDS:-30.0}
+    volumes:
+      # Mount shared specialized STT source for local development.
+      - ./stt_providers/app:/app/app:ro
+    networks:
+      - polytalk-network
+
+  sensevoice-stt:
+    build:
+      context: ./stt_providers
+      dockerfile: Dockerfile
+      args:
+        STT_PROVIDER: sensevoice
+        STT_PROVIDER_MODEL: ${SENSEVOICE_STT_MODEL:-iic/SenseVoiceSmall}
+    image: polytalk-sensevoice-stt:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8013:8000"
+    environment:
+      - STT_PROVIDER=sensevoice
+      - STT_PROVIDER_MODEL=${SENSEVOICE_STT_MODEL:-iic/SenseVoiceSmall}
+      - STT_DEVICE=${SPECIALIZED_STT_DEVICE:-cpu}
+      - STT_PRELOAD_MODEL=${STT_PRELOAD_MODEL:-true}
+      - STT_STREAM_CHUNK_SECONDS=${STT_STREAM_CHUNK_SECONDS:-3.0}
+      - STT_EMIT_PARTIALS=${SPECIALIZED_STT_EMIT_PARTIALS:-false}
+      - STT_PAUSE_FLUSH_SECONDS=${STT_PAUSE_FLUSH_SECONDS:-2.0}
+      - STT_SILENCE_RMS_THRESHOLD=${STT_SILENCE_RMS_THRESHOLD:-0.003}
+      - STT_MAX_UTTERANCE_SECONDS=${STT_MAX_UTTERANCE_SECONDS:-30.0}
+    volumes:
+      # Mount shared specialized STT source for local development.
+      - ./stt_providers/app:/app/app:ro
+    networks:
+      - polytalk-network
 
   tts:
     build:
@@ -90,6 +178,35 @@ services:
     networks:
       - polytalk-network
 
+  indic-parler-tts:
+    build:
+      context: ./indic_parler_tts
+      dockerfile: Dockerfile
+      args:
+        PARLER_TTS_REPOSITORY: ${PARLER_TTS_REPOSITORY:-https://github.com/huggingface/parler-tts.git}
+        PARLER_TTS_REF: ${PARLER_TTS_REF:-main}
+        INDIC_PARLER_MODEL: ${INDIC_PARLER_MODEL:-ai4bharat/indic-parler-tts}
+        INDIC_PARLER_REVISION: ${INDIC_PARLER_REVISION:-main}
+        INDIC_PARLER_TORCH_VERSION: ${INDIC_PARLER_TORCH_VERSION:-2.5.1}
+        INDIC_PARLER_TORCH_INDEX_URL: ${INDIC_PARLER_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+      secrets:
+        - hf_token
+    image: polytalk-indic-parler-tts:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7790:7790"
+    environment:
+      - INDIC_PARLER_DEVICE=${INDIC_PARLER_DEVICE:-auto}
+      - INDIC_PARLER_PRELOAD_MODEL=${INDIC_PARLER_PRELOAD_MODEL:-true}
+      - INDIC_PARLER_MAX_TEXT_CHARS=${INDIC_PARLER_MAX_TEXT_CHARS:-1000}
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    volumes:
+      # Mount only the local API adapter; model files stay image-backed.
+      - ./indic_parler_tts/app.py:/app/app.py:ro
+    networks:
+      - polytalk-network
+
   polytalk:
     build:
       context: .
@@ -102,6 +219,17 @@ services:
       - WHISPER_BASE_URL=${WHISPER_BASE_URL:-http://stt:8000}
       - WHISPER_API_KEY=${WHISPER_API_KEY:-}
       - WHISPER_WS_ENDPOINT=${WHISPER_WS_ENDPOINT:-/v1/stream/transcriptions}
+      - INDIC_STT_BASE_URL=${INDIC_STT_BASE_URL:-http://indicconformer-stt:8000}
+      - PARAKEET_STT_BASE_URL=${PARAKEET_STT_BASE_URL:-http://parakeet-stt:8000}
+      - SENSEVOICE_STT_BASE_URL=${SENSEVOICE_STT_BASE_URL:-http://sensevoice-stt:8000}
+      - STT_ROUTING_ENABLED=${STT_ROUTING_ENABLED:-false}
+      - INDIC_STT_ENABLED=${INDIC_STT_ENABLED:-false}
+      - PARAKEET_STT_ENABLED=${PARAKEET_STT_ENABLED:-false}
+      - SENSEVOICE_STT_ENABLED=${SENSEVOICE_STT_ENABLED:-false}
+      # Shared VAD rollout (off, shadow, boundary, or active)
+      - VAD_CONVERSATION_MODE=${VAD_CONVERSATION_MODE:-off}
+      - VAD_LIVE_MICROPHONE_MODE=${VAD_LIVE_MICROPHONE_MODE:-off}
+      - VAD_SHARE_MODE=${VAD_SHARE_MODE:-off}
       # Translation service
       - TRANSLATION_API_FORMAT=${TRANSLATION_API_FORMAT:-openai_chat}
       - TRANSLATION_BASE_URL=${TRANSLATION_BASE_URL:-https://api.openai.com}
@@ -109,6 +237,14 @@ services:
       - TRANSLATION_API_KEY=${TRANSLATION_API_KEY:-}
       - TRANSLATION_MODEL=${TRANSLATION_MODEL:-gpt-4o-mini}
       - TRANSLATION_MAX_TOKENS=${TRANSLATION_MAX_TOKENS:-160}
+      - SEMANTIC_BOUNDARY_ENABLED=${SEMANTIC_BOUNDARY_ENABLED:-true}
+      - SEMANTIC_BOUNDARY_PROVIDER=${SEMANTIC_BOUNDARY_PROVIDER:-}
+      - SEMANTIC_BOUNDARY_TIMEOUT_SECONDS=${SEMANTIC_BOUNDARY_TIMEOUT_SECONDS:-5.0}
+      - SEMANTIC_BOUNDARY_MIN_CONFIDENCE=${SEMANTIC_BOUNDARY_MIN_CONFIDENCE:-0.75}
+      - SEMANTIC_BOUNDARY_MAX_TOKENS=${SEMANTIC_BOUNDARY_MAX_TOKENS:-100}
+      - SEMANTIC_BOUNDARY_DISABLE_THINKING=${SEMANTIC_BOUNDARY_DISABLE_THINKING:-true}
+      - SEMANTIC_BOUNDARY_CHAT_TEMPLATE_KWARGS_ENABLED=${SEMANTIC_BOUNDARY_CHAT_TEMPLATE_KWARGS_ENABLED:-true}
+      - SEMANTIC_BOUNDARY_PROBE_COOLDOWN_SECONDS=${SEMANTIC_BOUNDARY_PROBE_COOLDOWN_SECONDS:-3.0}
       - TRANSLATEGAMMA_API_FORMAT=${TRANSLATEGAMMA_API_FORMAT:-${TRANSLATION_API_FORMAT:-openai_chat}}
       - TRANSLATEGAMMA_BASE_URL=${TRANSLATEGAMMA_BASE_URL:-${TRANSLATION_BASE_URL:-https://api.openai.com}}
       - TRANSLATEGAMMA_ENDPOINT=${TRANSLATEGAMMA_ENDPOINT:-${TRANSLATION_ENDPOINT:-/v1/chat/completions}}
@@ -116,7 +252,7 @@ services:
       - TRANSLATEGAMMA_MODEL=${TRANSLATEGAMMA_MODEL:-${TRANSLATION_MODEL:-gpt-4o-mini}}
       # Visual context service
       - VISUAL_CONTEXT_ENABLED=${VISUAL_CONTEXT_ENABLED:-false}
-      - VISUAL_CONTEXT_MOCK_MODE=${VISUAL_CONTEXT_MOCK_MODE:-true}
+      - VISUAL_CONTEXT_MOCK_MODE=${VISUAL_CONTEXT_MOCK_MODE:-false}
       - VISUAL_CONTEXT_API_FORMAT=${VISUAL_CONTEXT_API_FORMAT:-openai_chat}
       - VISUAL_CONTEXT_BASE_URL=${VISUAL_CONTEXT_BASE_URL:-${TRANSLATION_BASE_URL:-https://api.openai.com}}
       - VISUAL_CONTEXT_ENDPOINT=${VISUAL_CONTEXT_ENDPOINT:-${TRANSLATION_ENDPOINT:-/v1/chat/completions}}
@@ -125,6 +261,17 @@ services:
       - VISUAL_CONTEXT_MAX_TOKENS=${VISUAL_CONTEXT_MAX_TOKENS:-240}
       # TTS services
       - TTS_BASE_URL=${TTS_BASE_URL:-http://tts:5000}
+      - INDIC_PARLER_TTS_BASE_URL=${INDIC_PARLER_TTS_BASE_URL:-http://indic-parler-tts:7790}
+      - INDIC_PARLER_TTS_GENDER=${INDIC_PARLER_TTS_GENDER:-female}
+      - INDIC_PARLER_TTS_VOICE=${INDIC_PARLER_TTS_VOICE:-auto}
+      - INDIC_PARLER_TTS_PACE=${INDIC_PARLER_TTS_PACE:-moderate}
+      - INDIC_PARLER_TTS_GU_PACE=${INDIC_PARLER_TTS_GU_PACE:-moderate}
+      - INDIC_PARLER_TTS_OR_PACE=${INDIC_PARLER_TTS_OR_PACE:-moderate}
+      - INDIC_PARLER_TTS_SPEED=${INDIC_PARLER_TTS_SPEED:-1.0}
+      - INDIC_PARLER_TTS_GU_SPEED=${INDIC_PARLER_TTS_GU_SPEED:-1.0}
+      - INDIC_PARLER_TTS_OR_SPEED=${INDIC_PARLER_TTS_OR_SPEED:-1.0}
+      - INDIC_PARLER_TTS_DESCRIPTION=${INDIC_PARLER_TTS_DESCRIPTION:-}
+      - INDIC_PARLER_TTS_TIMEOUT=${INDIC_PARLER_TTS_TIMEOUT:-180}
       - SUPERTONIC_TTS_BASE_URL=${SUPERTONIC_TTS_BASE_URL:-http://supertonic-tts:7788}
       - SUPERTONIC_TTS_VOICE=${SUPERTONIC_TTS_VOICE:-M1}
       - SUPERTONIC_TTS_JA_VOICE=${SUPERTONIC_TTS_JA_VOICE:-M1}
@@ -139,8 +286,10 @@ services:
       - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:9000,http://127.0.0.1:9000}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TRANSLATION_FLUSH_CHARS=${TRANSLATION_FLUSH_CHARS:-120}
-      - TRANSLATION_FLUSH_SECONDS=${TRANSLATION_FLUSH_SECONDS:-2.0}
+      - TRANSLATION_FLUSH_SECONDS=${TRANSLATION_FLUSH_SECONDS:-6.0}
       - TRANSLATION_FLUSH_MIN_CHARS=${TRANSLATION_FLUSH_MIN_CHARS:-40}
+      - TRANSLATION_PAUSE_COMMIT_MODE=${TRANSLATION_PAUSE_COMMIT_MODE:-immediate}
+      - TRANSLATION_SEMANTIC_HARD_SECONDS=${TRANSLATION_SEMANTIC_HARD_SECONDS:-10.0}
       - CUSTOM_INSTRUCTION_MAX_CHARS=${CUSTOM_INSTRUCTION_MAX_CHARS:-250}
     volumes:
       # Mount app source for development (remove for production)
@@ -156,6 +305,14 @@ services:
       - stt
       - tts
       - supertonic-tts
+      # Uncomment below to enable routed STT providers and Indic Parler TTS.
+      # These services require GPU/CPU resources for model loading.
+      # To enable: uncomment the provider lines below AND set the
+      # corresponding environment variables in the polytalk service above.
+      # - indicconformer-stt
+      # - parakeet-stt
+      # - sensevoice-stt
+      # - indic-parler-tts
     networks:
       - polytalk-network
 
@@ -166,3 +323,7 @@ volumes:
 networks:
   polytalk-network:
     driver: bridge
+
+secrets:
+  hf_token:
+    environment: HF_TOKEN

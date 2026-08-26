@@ -15,18 +15,46 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Optional, AsyncGenerator
+from typing import Any, AsyncGenerator, Optional
 
-from .base import TranslationResult, TTSResult
-from .whisper_service import WhisperService
-from .translation_service import TranslationService
-from .tts_service import TTSService
 from ..config import get_config
 from ..utils.config import get_custom_instruction_max_chars, parse_bool_config
 from ..utils.logger import get_logger
 from ..utils.sanitize import normalize_instruction
+from ..utils.translation_buffer import clamp_translation_buffer_seconds
+from .base import TranslationResult, TTSResult
+from .audio_vad import AudioVadService, VadMode
+from .translation_service import TranslationService
+from .tts_service import TTSService
+from .whisper_service import WhisperService
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class TextSpeechResult:
+    """In-memory audio produced from one bounded text chunk."""
+
+    audio: bytes = b""
+    media_type: str = "audio/wav"
+    duration: Optional[float] = None
+    success: bool = True
+    error: Optional[str] = None
+
+
+def _semantic_probe_is_cooling_down(
+    last_probe_at: Optional[float],
+    now: float,
+    cooldown_seconds: float,
+    *,
+    bypass: bool = False,
+) -> bool:
+    """Return whether a cadence probe should wait; explicit pauses bypass it."""
+    return (
+        not bypass
+        and last_probe_at is not None
+        and now - last_probe_at < cooldown_seconds
+    )
 
 
 @dataclass
@@ -78,6 +106,25 @@ class TranslationContextWindow:
         )
 
 
+def _extract_translation_confidence(result: Any) -> Optional[float]:
+    """Extract confidence score from a TranslationResult if available.
+
+    Returns None when no confidence data is available (e.g. mock mode,
+    disabled service, or LLM response without confidence indicator).
+    This preserves the semantic difference between "no confidence data"
+    and "very low confidence (0.0)".
+    """
+    try:
+        if (
+            hasattr(result, "translation_quality")
+            and result.translation_quality is not None
+        ):
+            return float(result.translation_quality)
+    except Exception:
+        logger.debug("Failed to extract translation confidence", exc_info=True)
+    return None
+
+
 class TranslationPipelineService:
     """
     Orchestrates the full speech-to-speech translation pipeline.
@@ -96,6 +143,7 @@ class TranslationPipelineService:
         translation_service: Optional[TranslationService] = None,
         tts_service: Optional[TTSService] = None,
         warm_connections: bool = True,
+        vad_service: Optional[AudioVadService] = None,
     ) -> None:
         """
         Initialize the translation pipeline.
@@ -105,10 +153,12 @@ class TranslationPipelineService:
             translation_service: Optional Translation service instance
             tts_service: Optional TTS service instance
             warm_connections: Whether to pre-warm connections (default: True)
+            vad_service: Optional shared audio VAD service instance
         """
         self.whisper = whisper_service or WhisperService()
         self.translation = translation_service or TranslationService()
         self.tts = tts_service or TTSService()
+        self.vad = vad_service or AudioVadService()
         self.media_dir = get_config().media_output_dir
 
         logger.info("TranslationPipelineService initialized")
@@ -179,6 +229,85 @@ class TranslationPipelineService:
 
         return await self.tts.synthesize(text, language, output_path)
 
+    async def translate_text_to_speech(
+        self,
+        text: str,
+        source_language: str,
+        target_language: str,
+        *,
+        custom_translation_routing: bool = False,
+    ) -> TextSpeechResult:
+        """Translate one text chunk and return synthesized audio in memory.
+
+        Existing TTS providers write responses to the media directory. This
+        flow reads that artifact and removes it immediately so selected-text
+        audio is not retained by the core media mount.
+        """
+        translation = await self.translation.translate(
+            text,
+            source_language,
+            target_language,
+            custom_translation_routing=custom_translation_routing,
+        )
+        if not translation.success or not translation.text.strip():
+            return TextSpeechResult(
+                success=False,
+                error=translation.error or "Translation failed",
+            )
+
+        tts_result = await self._synthesize(
+            translation.text,
+            target_language,
+            save_media=False,
+        )
+        if not tts_result.success or tts_result.audio_path is None:
+            return TextSpeechResult(
+                success=False,
+                error=tts_result.error or "Speech synthesis failed",
+            )
+
+        media_root = self.media_dir.resolve()
+        audio_path = tts_result.audio_path.resolve()
+        try:
+            audio_path.relative_to(media_root)
+        except ValueError:
+            logger.error("TTS returned an audio path outside the media directory")
+            return TextSpeechResult(
+                success=False,
+                error="Speech synthesis returned an invalid audio artifact",
+            )
+
+        try:
+            audio = await asyncio.to_thread(audio_path.read_bytes)
+        except OSError:
+            logger.exception("Failed to read transient text-to-speech artifact")
+            return TextSpeechResult(
+                success=False,
+                error="Speech synthesis audio was unavailable",
+            )
+        finally:
+            try:
+                await asyncio.to_thread(audio_path.unlink, missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Failed to remove transient text-to-speech artifact",
+                    exc_info=True,
+                )
+
+        if not audio:
+            return TextSpeechResult(
+                success=False,
+                error="Speech synthesis returned empty audio",
+            )
+        media_type = (
+            "audio/mpeg" if audio_path.suffix.lower() == ".mp3" else "audio/wav"
+        )
+        return TextSpeechResult(
+            audio=audio,
+            media_type=media_type,
+            duration=tts_result.duration,
+        )
+
     async def _warm_connections(self) -> None:
         """
         Pre-warm connections to Whisper and Translation services.
@@ -203,7 +332,8 @@ class TranslationPipelineService:
                         logger.info("Translation connection warmed")
                     except Exception as e:
                         logger.warning(
-                            f"Translation warm-up failed (will retry on demand): {e}"
+                            "Translation warm-up failed; will retry on demand: type=%s",
+                            type(e).__name__,
                         )
 
                 # Whisper WebSocket will be warmed on first stream_transcribe call
@@ -211,7 +341,10 @@ class TranslationPipelineService:
 
                 logger.info("Connection pre-warming complete")
             except Exception as e:
-                logger.error(f"Connection pre-warming error: {e}")
+                logger.error(
+                    "Connection pre-warming error: type=%s",
+                    type(e).__name__,
+                )
 
     @staticmethod
     def _normalize_transcript_text(text: str) -> str:
@@ -317,6 +450,8 @@ class TranslationPipelineService:
         visual_context_queue: Optional[asyncio.Queue] = None,
         custom_instruction: Optional[str] = None,
         custom_instruction_queue: Optional[asyncio.Queue] = None,
+        custom_translation_routing: bool = False,
+        input_segmentation: Optional[str] = None,
     ) -> AsyncGenerator[dict, None]:
         """Process pause-delimited bidirectional conversation turns."""
         logger.info(
@@ -337,6 +472,9 @@ class TranslationPipelineService:
 
         async def paused_audio_generator():
             async for chunk in audio_generator:
+                if chunk == b"__END_SIGNAL__":
+                    yield chunk
+                    return
                 while pause_event.is_set():
                     await asyncio.sleep(0.1)
                 yield chunk
@@ -379,6 +517,11 @@ class TranslationPipelineService:
                 None,
                 emit_policy="pause",
                 candidate_languages=[source_language, target_language],
+                **(
+                    {"input_segmentation": input_segmentation}
+                    if input_segmentation
+                    else {}
+                ),
             ):
                 await drain_visual_context_updates()
                 await drain_custom_instruction_updates()
@@ -415,6 +558,11 @@ class TranslationPipelineService:
                     context=translation_context.snapshot(),
                     visual_context=visual_context_summary,
                     custom_instruction=current_custom_instruction,
+                    **(
+                        {"custom_translation_routing": True}
+                        if custom_translation_routing
+                        else {}
+                    ),
                 )
                 if not result.success:
                     yield {
@@ -422,6 +570,8 @@ class TranslationPipelineService:
                         "error": result.error or "Translation failed",
                     }
                     continue
+
+                translation_confidence = _extract_translation_confidence(result)
 
                 yield {
                     "type": "conversation_turn",
@@ -431,6 +581,7 @@ class TranslationPipelineService:
                     "detected_language": trans_result.language,
                     "transcript": text_to_translate,
                     "translated_text": result.text,
+                    "translation_confidence": translation_confidence,
                 }
 
                 tts_result = await self._synthesize(
@@ -452,7 +603,10 @@ class TranslationPipelineService:
             logger.info("Conversation pipeline cancelled")
             raise
         except Exception as e:
-            logger.error(f"Conversation pipeline error: {e}")
+            logger.error(
+                "Conversation pipeline error: type=%s",
+                type(e).__name__,
+            )
             yield {"type": "error", "error": str(e), "success": False}
 
     async def process_streaming(
@@ -467,6 +621,11 @@ class TranslationPipelineService:
         mode: str = "live",
         custom_instruction: Optional[str] = None,
         custom_instruction_queue: Optional[asyncio.Queue] = None,
+        custom_translation_routing: bool = False,
+        translation_buffer_seconds: Optional[float] = None,
+        translation_buffer_config_queue: Optional[asyncio.Queue] = None,
+        stt_emit_interval_config_queue: Optional[asyncio.Queue] = None,
+        input_type: str = "microphone",
     ) -> AsyncGenerator[dict, None]:
         """
         Process streaming audio with the real-time translation pipeline.
@@ -492,10 +651,30 @@ class TranslationPipelineService:
             custom_instruction: Optional user-provided translation guidance
             custom_instruction_queue: Optional asyncio.Queue for runtime custom
                 translation instruction updates
+            translation_buffer_seconds: Optional session override for translation
+                buffering and STT emission pacing
+            translation_buffer_config_queue: Optional asyncio.Queue for runtime
+                translation buffer updates
+            stt_emit_interval_config_queue: Optional asyncio.Queue for runtime STT
+                emission interval updates
 
         Yields:
             Dictionary with streaming pipeline results
         """
+        vad_mode = self.vad.effective_mode(mode, input_type)
+        audio_generator = self.vad.process_stream(
+            audio_generator,
+            mode=mode,
+            input_type=input_type,
+        )
+        input_segmentation = (
+            "upstream_vad" if vad_mode in {VadMode.BOUNDARY, VadMode.ACTIVE} else None
+        )
+        logger.info(
+            "Audio VAD stream configured: profile=%s mode=%s",
+            input_type if mode != "conversation" else "conversation",
+            vad_mode.value,
+        )
 
         if mode == "conversation":
             async for result in self._process_conversation_streaming(
@@ -507,6 +686,12 @@ class TranslationPipelineService:
                 visual_context_queue=visual_context_queue,
                 custom_instruction=custom_instruction,
                 custom_instruction_queue=custom_instruction_queue,
+                **(
+                    {"custom_translation_routing": True}
+                    if custom_translation_routing
+                    else {}
+                ),
+                input_segmentation=input_segmentation,
             ):
                 yield result
             return
@@ -534,6 +719,12 @@ class TranslationPipelineService:
             except (TypeError, ValueError):
                 return default
 
+        def translation_float_config(key: str, default: float) -> float:
+            try:
+                return float(translation_config.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
         def float_config(key: str, default: float) -> float:
             try:
                 return float(app_config.get(key, default))
@@ -545,6 +736,27 @@ class TranslationPipelineService:
         translation_flush_chars = int_config("translation_flush_chars", 120)
         translation_flush_seconds = float_config("translation_flush_seconds", 2.0)
         translation_flush_min_chars = int_config("translation_flush_min_chars", 40)
+        translation_pause_commit_mode = (
+            str(app_config.get("translation_pause_commit_mode", "immediate"))
+            .strip()
+            .lower()
+        )
+        if translation_pause_commit_mode not in {"immediate", "semantic"}:
+            logger.warning("Invalid translation pause commit mode; using immediate")
+            translation_pause_commit_mode = "immediate"
+        translation_semantic_hard_seconds = max(
+            1.0, float_config("translation_semantic_hard_seconds", 10.0)
+        )
+        translation_semantic_probe_cooldown_seconds = max(
+            0.0,
+            translation_float_config("semantic_boundary_probe_cooldown_seconds", 3.0),
+        )
+        session_buffer_seconds = clamp_translation_buffer_seconds(
+            translation_buffer_seconds
+        )
+        session_translation_pacing = session_buffer_seconds is not None
+        if session_buffer_seconds is not None:
+            translation_flush_seconds = session_buffer_seconds
         translation_context_enabled = parse_bool_config(
             translation_config.get("context_enabled"), True
         )
@@ -564,6 +776,9 @@ class TranslationPipelineService:
         stop_event = asyncio.Event()
         pause_event = pause_event or asyncio.Event()
         language_swap_queue = language_swap_queue or asyncio.Queue()
+        translation_buffer_config_queue = (
+            translation_buffer_config_queue or asyncio.Queue()
+        )
 
         # Shared state
         detected_language = source_language
@@ -590,6 +805,9 @@ class TranslationPipelineService:
         async def paused_audio_generator():
             """Wrapper generator that pauses when pause_event is set."""
             async for chunk in audio_generator:
+                if chunk == b"__END_SIGNAL__":
+                    yield chunk
+                    return
                 while pause_event.is_set():
                     await asyncio.sleep(0.1)
                 yield chunk
@@ -636,8 +854,11 @@ class TranslationPipelineService:
 
                     elapsed = time.time() - pipeline_start_time
                     logger.debug(
-                        f"[TIMING] TTS sentence {tts_seq} at {elapsed:.2f}s: "
-                        f"'{translated_sentence.text[:50]}...'"
+                        "[TIMING] TTS sentence %d at %.2fs: language=%s chars=%d",
+                        tts_seq,
+                        elapsed,
+                        target_lang,
+                        len(translated_sentence.text),
                     )
 
                     # Generate TTS
@@ -659,15 +880,16 @@ class TranslationPipelineService:
                             duration = getattr(tts_result, "duration", 0.0) or 0.0
                             logger.debug(
                                 "[PIPELINE_METRIC] TTS completed "
-                                f"seq={tts_seq} queue_wait={tts_queue_wait:.3f}s "
-                                f"duration={duration:.3f}s "
-                                f"tts_queue={tts_queue.qsize()} "
-                                f"result_queue={result_queue.qsize()}"
+                                "seq=%d queue_wait=%.3fs duration=%.3fs "
+                                "tts_queue=%d result_queue=%d",
+                                tts_seq,
+                                tts_queue_wait,
+                                duration,
+                                tts_queue.qsize(),
+                                result_queue.qsize(),
                             )
                         else:
-                            logger.error(
-                                f"TTS worker: TTS generation failed - {tts_result.error}"
-                            )
+                            logger.error("TTS worker: TTS generation failed")
                             await result_queue.put(
                                 {
                                     "type": "error",
@@ -676,7 +898,10 @@ class TranslationPipelineService:
                             )
 
                     except Exception as e:
-                        logger.error(f"TTS worker: error generating TTS: {e}")
+                        logger.error(
+                            "TTS worker: error generating TTS: type=%s",
+                            type(e).__name__,
+                        )
                         await result_queue.put({"type": "error", "error": str(e)})
                         pending_items -= 1
 
@@ -686,7 +911,7 @@ class TranslationPipelineService:
             except asyncio.CancelledError:
                 logger.info(f"TTS worker: cancelled, pending={pending_items}")
             except Exception as e:
-                logger.error(f"TTS worker error: {e}")
+                logger.error("TTS worker error: type=%s", type(e).__name__)
                 await result_queue.put({"type": "error", "error": str(e)})
 
         async def asr_worker():
@@ -695,7 +920,15 @@ class TranslationPipelineService:
             try:
                 logger.info("ASR worker: starting stream_transcribe")
                 async for trans_result in self.whisper.stream_transcribe(
-                    paused_audio_generator(), detected_language
+                    paused_audio_generator(),
+                    detected_language,
+                    emit_interval_seconds=session_buffer_seconds,
+                    emit_interval_config_queue=stt_emit_interval_config_queue,
+                    **(
+                        {"input_segmentation": input_segmentation}
+                        if input_segmentation
+                        else {}
+                    ),
                 ):
                     logger.debug(
                         f"ASR worker: got transcription result, success={trans_result.success}"
@@ -740,9 +973,7 @@ class TranslationPipelineService:
                             f"queue_depth={trans_queue.qsize()}"
                         )
                     else:
-                        logger.error(
-                            f"ASR worker: transcription failed - {trans_result.error}"
-                        )
+                        logger.error("ASR worker: transcription failed")
                         await trans_queue.put(
                             {"type": "error", "error": trans_result.error}
                         )
@@ -751,7 +982,7 @@ class TranslationPipelineService:
             except asyncio.CancelledError:
                 logger.info("ASR worker: cancelled")
             except Exception as e:
-                logger.error(f"ASR worker error: {e}")
+                logger.error("ASR worker error: type=%s", type(e).__name__)
                 await trans_queue.put({"type": "error", "error": str(e)})
             finally:
                 await trans_queue.put({"type": "done"})
@@ -823,6 +1054,29 @@ class TranslationPipelineService:
                         f"chars={len(current_custom_instruction or '')}"
                     )
 
+            async def drain_translation_buffer_config_updates() -> None:
+                """Apply the newest validated translation buffer value."""
+                nonlocal translation_flush_seconds, session_translation_pacing
+                latest_seconds = None
+                while True:
+                    try:
+                        latest_seconds = translation_buffer_config_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                seconds = clamp_translation_buffer_seconds(latest_seconds)
+                if seconds is None:
+                    return
+                changed = (
+                    seconds != translation_flush_seconds
+                    or not session_translation_pacing
+                )
+                translation_flush_seconds = seconds
+                session_translation_pacing = True
+                if changed:
+                    logger.info(
+                        f"Session translation pacing updated: seconds={seconds:.1f}"
+                    )
+
             async def enqueue_tts(text: str, sequence: int) -> None:
                 await tts_queue.put(
                     TranslatedSentence(
@@ -836,50 +1090,122 @@ class TranslationPipelineService:
                     f"seq={sequence} tts_queue={tts_queue.qsize()}"
                 )
 
-            async def flush_translation_buffer(reason: str) -> None:
+            async def flush_translation_buffer(
+                reason: str, boundary: Optional[int] = None
+            ) -> None:
                 nonlocal full_translation, translation_buffer
                 nonlocal translation_buffer_started_at, translation_sequence
 
                 await drain_visual_context_updates()
                 await drain_custom_instruction_updates()
+                await drain_translation_buffer_config_updates()
 
-                remaining_text = translation_buffer.strip()
-                if not remaining_text:
+                buffered_text = translation_buffer.strip()
+                if not buffered_text:
+                    return
+                original_buffer_started_at = translation_buffer_started_at
+
+                if boundary is None:
+                    text_to_commit = buffered_text
+                    retained_text = ""
+                else:
+                    safe_boundary = max(0, min(int(boundary), len(buffered_text)))
+                    text_to_commit = buffered_text[:safe_boundary].strip()
+                    retained_text = buffered_text[safe_boundary:].strip()
+                if not text_to_commit:
                     return
 
-                translation_buffer = ""
-                translation_buffer_started_at = None
                 logger.info(
-                    f"Flushing translation buffer ({reason}): "
-                    f"'{remaining_text[:80]}...'"
+                    "Flushing translation buffer (%s): chars=%d retained_chars=%d",
+                    reason,
+                    len(text_to_commit),
+                    len(retained_text),
                 )
                 try:
                     result = await self.translation.translate(
-                        remaining_text,
+                        text_to_commit,
                         translation_source_lang,
                         target_lang,
                         context=translation_context.snapshot(),
                         visual_context=visual_context_summary,
                         custom_instruction=current_custom_instruction,
+                        **(
+                            {"custom_translation_routing": True}
+                            if custom_translation_routing
+                            else {}
+                        ),
                     )
-                    if result.success:
-                        translation_context.remember(remaining_text, result.text)
-                        full_translation += " " + result.text
-                        full_translation = full_translation.strip()
-                        await result_queue.put(
-                            {
-                                "type": "translation",
-                                "translated_text": full_translation,
-                            }
-                        )
-                        await enqueue_tts(result.text, translation_sequence)
-                        translation_sequence += 1
-                    else:
-                        logger.warning(
-                            f"Failed to flush buffer ({reason}): {result.error}"
-                        )
-                except Exception as e:
-                    logger.error(f"Failed to flush buffer ({reason}): {e}")
+                    if not result.success:
+                        logger.warning("Failed to flush buffer (%s)", reason)
+                        return
+
+                    translation_buffer = retained_text
+                    translation_buffer_started_at = (
+                        original_buffer_started_at if retained_text else None
+                    )
+                    translation_context.remember(text_to_commit, result.text)
+                    full_translation = (full_translation + " " + result.text).strip()
+                    translation_confidence = _extract_translation_confidence(result)
+                    await result_queue.put(
+                        {
+                            "type": "translation",
+                            "translated_text": full_translation,
+                            "translation_confidence": translation_confidence,
+                        }
+                    )
+                    await enqueue_tts(result.text, translation_sequence)
+                    translation_sequence += 1
+                except Exception as exc:
+                    logger.error(
+                        "Failed to flush buffer (%s): %s",
+                        reason,
+                        type(exc).__name__,
+                    )
+
+            last_semantic_probe_text = ""
+            last_semantic_probe_at: Optional[float] = None
+
+            async def flush_semantic_prefix(reason: str) -> None:
+                """Commit only the original-text prefix approved by the selector."""
+                nonlocal last_semantic_probe_at, last_semantic_probe_text
+                buffered_text = translation_buffer.strip()
+                if not buffered_text or buffered_text == last_semantic_probe_text:
+                    return
+                now = time.monotonic()
+                if _semantic_probe_is_cooling_down(
+                    last_semantic_probe_at,
+                    now,
+                    translation_semantic_probe_cooldown_seconds,
+                    bypass=reason == "acoustic pause",
+                ):
+                    return
+                last_semantic_probe_text = buffered_text
+                buffer_age = (
+                    time.time() - translation_buffer_started_at
+                    if translation_buffer_started_at is not None
+                    else 0.0
+                )
+                hard_deadline_remaining = max(
+                    0.0, translation_semantic_hard_seconds - buffer_age
+                )
+                if hard_deadline_remaining <= 0:
+                    await flush_translation_buffer("hard deadline")
+                    return
+                try:
+                    decision = await asyncio.wait_for(
+                        self.translation.select_semantic_boundary(
+                            buffered_text, translation_source_lang
+                        ),
+                        timeout=hard_deadline_remaining,
+                    )
+                except asyncio.TimeoutError:
+                    await flush_translation_buffer("hard deadline")
+                    return
+                finally:
+                    last_semantic_probe_at = time.monotonic()
+                if decision is None or decision.boundary <= 0:
+                    return
+                await flush_translation_buffer(reason, decision.boundary)
 
             try:
                 while True:
@@ -907,9 +1233,23 @@ class TranslationPipelineService:
                     except asyncio.TimeoutError:
                         await drain_visual_context_updates()
                         await drain_custom_instruction_updates()
+                        await drain_translation_buffer_config_updates()
                         if translation_buffer.strip() and translation_buffer_started_at:
                             buffer_age = time.time() - translation_buffer_started_at
-                            if buffer_age >= translation_flush_seconds:
+                            if (
+                                session_translation_pacing
+                                and buffer_age >= translation_semantic_hard_seconds
+                            ):
+                                await flush_translation_buffer("hard deadline")
+                            elif (
+                                session_translation_pacing
+                                and buffer_age >= translation_flush_seconds
+                            ):
+                                await flush_semantic_prefix("semantic timeout")
+                            elif (
+                                not session_translation_pacing
+                                and buffer_age >= translation_flush_seconds
+                            ):
                                 await flush_translation_buffer("idle timeout")
                         if stop_event.is_set():
                             break
@@ -932,6 +1272,7 @@ class TranslationPipelineService:
 
                     await drain_visual_context_updates()
                     await drain_custom_instruction_updates()
+                    await drain_translation_buffer_config_updates()
 
                     trans_result = msg["result"]
                     asr_translation_queue_wait = (
@@ -947,6 +1288,9 @@ class TranslationPipelineService:
                     current_text = trans_result.text.strip()
                     trans_metrics = trans_result.metrics or {}
                     is_pause_flush = bool(trans_metrics.get("force_emit"))
+                    is_max_duration_flush = (
+                        trans_metrics.get("finalization_reason") == "max_duration"
+                    )
 
                     if not current_text:
                         continue
@@ -981,10 +1325,11 @@ class TranslationPipelineService:
                         }
                     )
 
-                    # Log all text updates for debugging
                     logger.debug(
-                        f"ASR: len={len(current_text)}, last_len={len(last_transcribed_text)}, "
-                        f"text='{current_text[:100]}...'"
+                        "ASR progress: language=%s chars=%d previous_chars=%d",
+                        detected_language,
+                        len(current_text),
+                        len(last_transcribed_text),
                     )
 
                     # STT emits cumulative text, so translate only the new delta.
@@ -1000,19 +1345,28 @@ class TranslationPipelineService:
                         )
                         continue
 
-                    logger.debug(f"New transcript delta: '{text_to_translate[:50]}...'")
+                    logger.debug(
+                        "New transcript delta: language=%s chars=%d",
+                        detected_language,
+                        len(text_to_translate),
+                    )
 
                     # Skip if text too short (reduced threshold)
                     if len(text_to_translate.strip()) < 3:
                         logger.debug(
-                            f"Skipping: text too short '{text_to_translate[:30]}...' (len={len(text_to_translate)})"
+                            "Skipping short transcript delta: language=%s chars=%d",
+                            detected_language,
+                            len(text_to_translate),
                         )
                         continue
 
                     elapsed = time.time() - pipeline_start_time
                     logger.debug(
-                        f"[TIMING] Translation candidate at {elapsed:.2f}s: "
-                        f"'{text_to_translate[:50]}...'"
+                        "[TIMING] Translation candidate at %.2fs: %s -> %s chars=%d",
+                        elapsed,
+                        detected_language,
+                        target_lang,
+                        len(text_to_translate),
                     )
 
                     # Buffer short deltas to avoid low-context translations and TTS chatter.
@@ -1021,29 +1375,61 @@ class TranslationPipelineService:
                     translation_buffer = translation_buffer.strip()
                     if translation_buffer_started_at is None:
                         translation_buffer_started_at = time.time()
+                        if session_translation_pacing:
+                            # The session cadence has already held this text in STT.
+                            # Count that interval so translation does not wait twice.
+                            translation_buffer_started_at -= translation_flush_seconds
 
                     is_sentence_complete = bool(
                         re.search(r"[.!?।؟]\s*$", translation_buffer)
                     )
                     buffer_age = time.time() - translation_buffer_started_at
 
-                    # Translate on sentence boundary, size threshold, or short time-based flush.
-                    should_translate = (
-                        is_sentence_complete
-                        or (is_pause_flush and len(translation_buffer) >= 3)
-                        or len(translation_buffer) >= translation_flush_chars
-                        or (
-                            buffer_age >= translation_flush_seconds
-                            and len(translation_buffer) >= translation_flush_min_chars
+                    if session_translation_pacing:
+                        if trans_result.is_partial is False:
+                            await flush_translation_buffer("final transcript")
+                            break
+                        if is_max_duration_flush:
+                            await flush_translation_buffer("stt max duration")
+                        elif is_pause_flush:
+                            if translation_pause_commit_mode == "immediate":
+                                await flush_translation_buffer("acoustic pause")
+                            else:
+                                await flush_semantic_prefix("acoustic pause")
+                        elif is_sentence_complete:
+                            await flush_translation_buffer("terminal punctuation")
+                        elif buffer_age >= translation_semantic_hard_seconds:
+                            await flush_translation_buffer("hard deadline")
+                        elif buffer_age >= translation_flush_seconds:
+                            await flush_semantic_prefix("semantic interval")
+                        else:
+                            logger.debug(
+                                "Accumulating session buffer: len=%d age=%.2fs",
+                                len(translation_buffer),
+                                buffer_age,
+                            )
+                        continue
+                    else:
+                        should_translate = (
+                            is_sentence_complete
+                            or (is_pause_flush and len(translation_buffer) >= 3)
+                            or len(translation_buffer) >= translation_flush_chars
+                            or (
+                                buffer_age >= translation_flush_seconds
+                                and len(translation_buffer)
+                                >= translation_flush_min_chars
+                            )
                         )
-                    )
 
                     if not should_translate:
                         logger.debug(
-                            f"Accumulating: '{translation_buffer[:50]}...' "
-                            f"(complete={is_sentence_complete}, "
-                            f"pause_flush={is_pause_flush}, "
-                            f"len={len(translation_buffer)})"
+                            "Accumulating translation input: %s -> %s "
+                            "(complete=%s, pause_flush=%s, chars=%d)",
+                            detected_language,
+                            target_lang,
+                            is_sentence_complete,
+                            is_pause_flush,
+                            len(translation_buffer),
                         )
                         continue
 
@@ -1053,7 +1439,10 @@ class TranslationPipelineService:
                     translation_buffer_started_at = None
 
                     logger.debug(
-                        f"Translating accumulated text: '{text_to_send[:80]}...'"
+                        "Translating accumulated input: %s -> %s chars=%d",
+                        detected_language,
+                        target_lang,
+                        len(text_to_send),
                     )
 
                     try:
@@ -1072,15 +1461,23 @@ class TranslationPipelineService:
                                     context=translation_context.snapshot(),
                                     visual_context=visual_context_summary,
                                     custom_instruction=current_custom_instruction,
+                                    **(
+                                        {"custom_translation_routing": True}
+                                        if custom_translation_routing
+                                        else {}
+                                    ),
                                 )
                                 if result.success:
                                     break
                                 logger.warning(
-                                    f"Translation attempt {attempt + 1} failed: {result.error}"
+                                    "Translation attempt %d failed",
+                                    attempt + 1,
                                 )
                             except Exception as e:
                                 logger.warning(
-                                    f"Translation attempt {attempt + 1} error: {e}"
+                                    "Translation attempt %d error: type=%s",
+                                    attempt + 1,
+                                    type(e).__name__,
                                 )
 
                             if attempt < max_retries - 1:
@@ -1116,11 +1513,16 @@ class TranslationPipelineService:
                             full_translation += " " + result.text
                             full_translation = full_translation.strip()
 
+                            translation_confidence = _extract_translation_confidence(
+                                result
+                            )
+
                             # Send incremental translation to frontend
                             await result_queue.put(
                                 {
                                     "type": "translation",
                                     "translated_text": full_translation,
+                                    "translation_confidence": translation_confidence,
                                 }
                             )
 
@@ -1129,11 +1531,18 @@ class TranslationPipelineService:
                             translation_sequence += 1
                         else:
                             logger.warning(
-                                f"Skipping TTS for failed translation: {text_to_send[:50]}..."
+                                "Skipping TTS for failed translation: %s -> %s "
+                                "source_chars=%d",
+                                detected_language,
+                                target_lang,
+                                len(text_to_send),
                             )
                             # Don't send empty text to TTS - skip to avoid wasting resources
                     except Exception as e:
-                        logger.error(f"Translation error: {e}")
+                        logger.error(
+                            "Translation error: type=%s",
+                            type(e).__name__,
+                        )
 
                     if trans_result.is_partial is False:
                         await flush_translation_buffer("final transcript")
@@ -1147,7 +1556,10 @@ class TranslationPipelineService:
                 logger.info("Translation worker: cancelled")
             except Exception as e:
                 translation_context.clear()
-                logger.error(f"Translation worker error: {e}")
+                logger.error(
+                    "Translation worker error: type=%s",
+                    type(e).__name__,
+                )
                 await result_queue.put({"type": "error", "error": str(e)})
 
         # Start worker tasks
@@ -1167,7 +1579,11 @@ class TranslationPipelineService:
 
                 if result.get("type") == "transcription":
                     trans_result = result["result"]
-                    logger.debug(f"Yielding transcription: {trans_result.text[:50]}")
+                    logger.debug(
+                        "Yielding transcription: language=%s chars=%d",
+                        detected_language,
+                        len(trans_result.text),
+                    )
                     yield {
                         "type": "transcription",
                         "transcript": trans_result.text,
@@ -1176,10 +1592,10 @@ class TranslationPipelineService:
                         "success": True,
                     }
                 elif result.get("type") in ["translation", "tts", "error"]:
-                    msg_content = (
-                        result.get("translated_text") or result.get("audio_url") or ""
+                    logger.debug(
+                        "Yielding pipeline result: type=%s",
+                        result.get("type"),
                     )
-                    logger.debug(f"Yielding {result.get('type')}: {msg_content[:50]}")
                     yield result
                 elif result.get("type") == "complete":
                     logger.info("Streaming pipeline complete")
@@ -1217,7 +1633,10 @@ class TranslationPipelineService:
 
             raise
         except Exception as e:
-            logger.error(f"Streaming pipeline error: {e}")
+            logger.error(
+                "Streaming pipeline error: type=%s",
+                type(e).__name__,
+            )
             stop_event.set()
 
             # Same graceful shutdown pattern

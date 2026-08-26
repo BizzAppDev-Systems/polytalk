@@ -176,7 +176,11 @@
     "AI Behavior": "Comportamento da IA",
     "Translation Instructions": "Instruções de tradução",
     "Translate formally. Keep technical terms in English.": "Traduza formalmente. Mantenha os termos técnicos em inglês.",
-    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "Orientação opcional enviada com sessões de tradução ao vivo, conversa e áudio da aba."
+    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "Orientação opcional enviada com sessões de tradução ao vivo, conversa e áudio da aba.",
+    "Advanced Translation Pacing": "Temporização avançada de tradução",
+    "Context window:": "Janela de contexto:",
+    "seconds": "segundos",
+    "Larger values reduce fragmented translations for slow speech, but translation and spoken audio arrive later. The live transcript remains immediate. Applies to live microphone and shared-tab sessions.": "Valores maiores reduzem traduções fragmentadas para fala lenta, mas a tradução e o áudio falado chegam mais tarde. A transcrição ao vivo permanece imediata. Aplica-se a sessões de microfone ao vivo e aba compartilhada."
   },
   "app.title": "PolyTalk - Tradução auto-hospedada com prioridade à privacidade",
   "js.error_message": "Erro: {error}",

@@ -123,6 +123,11 @@ class Config:
         return self._config.get("whisper", {})
 
     @property
+    def vad(self) -> dict:
+        """Get shared voice activity detection configuration."""
+        return self._config.get("vad", {})
+
+    @property
     def translation(self) -> dict:
         """Get translation AI configuration."""
         return self._config.get("translation", {})

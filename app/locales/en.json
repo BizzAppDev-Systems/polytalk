@@ -175,7 +175,11 @@
     "AI Behavior": "AI Behavior",
     "Translation Instructions": "Translation Instructions",
     "Translate formally. Keep technical terms in English.": "Translate formally. Keep technical terms in English.",
-    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "Optional guidance sent with live, conversation, and tab-audio translation sessions."
+    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "Optional guidance sent with live, conversation, and tab-audio translation sessions.",
+    "Advanced Translation Pacing": "Advanced Translation Pacing",
+    "Context window:": "Context window:",
+    "seconds": "seconds",
+    "Larger values reduce fragmented translations for slow speech, but translation and spoken audio arrive later. The live transcript remains immediate. Applies to live microphone and shared-tab sessions.": "Larger values reduce fragmented translations for slow speech, but translation and spoken audio arrive later. The live transcript remains immediate. Applies to live microphone and shared-tab sessions."
   },
   "app.title": "PolyTalk - Privacy-first Self-hosted Translation",
   "js.error_message": "Error: {error}",

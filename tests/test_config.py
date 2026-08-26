@@ -63,6 +63,19 @@ class TestConfig:
         assert parse_bool_config(2, True) is True
         assert parse_bool_config("unexpected", True) is True
 
+    def test_parse_float_config_values(self):
+        """Test shared floating-point config parsing helper."""
+        from app.utils.config import parse_float_config
+
+        assert parse_float_config(12.5, 30.0) == 12.5
+        assert parse_float_config("12.5", 30.0) == 12.5
+        assert parse_float_config("${STT_FALLBACK_REPLAY_MAX_SECONDS}", 30.0) == 30.0
+        assert (
+            parse_float_config("${STT_FALLBACK_REPLAY_MAX_SECONDS:-30.0}", 30.0) == 30.0
+        )
+        assert parse_float_config(None, 30.0) == 30.0
+        assert parse_float_config(True, 30.0) == 30.0
+
     def test_parse_int_config_values(self):
         """Test shared integer config parsing helper."""
         from app.utils.config import parse_int_config

@@ -56,6 +56,19 @@ def clear_custom_instruction_max_chars_cache() -> None:
     _cached_custom_instruction_max_chars.cache_clear()
 
 
+def parse_float_config(value: object, default: float) -> float:
+    """Parse a floating-point config value with a safe default."""
+    if isinstance(value, bool):
+        return default
+    normalized = str(value or "").strip()
+    if not normalized:
+        return default
+    try:
+        return float(normalized)
+    except (TypeError, ValueError):
+        return default
+
+
 def parse_int_config(
     value: object,
     default: int,

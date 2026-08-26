@@ -191,3 +191,28 @@ Before wiring a provider into a live deployment:
 
 For open-source deployments, prefer compatibility adapters around existing
 provider protocols before adding new pipeline behavior.
+
+## Built-in specialized speech providers
+
+The specialized providers keep the public PolyTalk contracts unchanged. Build
+and start the standard Compose stack with:
+
+    HF_TOKEN=hf_read_token_after_accepting_both_gated_model_terms
+    docker compose build --progress=plain
+    docker compose up -d --no-build
+
+Explicit source languages route through the configured STT provider list.
+Unknown-language and conversation sessions stay on faster-whisper unless a
+future probing policy is enabled. If a specialized backend fails before it
+emits text, buffered PCM is replayed once to the configured Whisper fallback.
+
+Indian target languages route to the Indic Parler adapter, whose binary WAV
+response is normalized to the same media URL contract used by Piper and
+Supertonic. Punjabi support is unofficial and should be treated as
+experimental. Provider errors fall back to Piper.
+
+The specialized STT and Indic Parler images download their configured models
+during build. The Indic Parler image clones and fast-forward-pulls the inference
+repository, then downloads the gated model and its description tokenizer using
+a BuildKit secret. The token is not stored in the image. No host source or model
+path is mounted into these containers. Runtime model access is offline.

@@ -176,7 +176,11 @@
     "AI Behavior": "AI-beteende",
     "Translation Instructions": "Översättningsinstruktioner",
     "Translate formally. Keep technical terms in English.": "Översätt formellt. Behåll tekniska termer på engelska.",
-    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "Valfria instruktioner som skickas med live-, konversations- och flikljudsöversättningssessioner."
+    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "Valfria instruktioner som skickas med live-, konversations- och flikljudsöversättningssessioner.",
+    "Advanced Translation Pacing": "Avancerad översättningstakt",
+    "Context window:": "Kontextfönster:",
+    "seconds": "sekunder",
+    "Larger values reduce fragmented translations for slow speech, but translation and spoken audio arrive later. The live transcript remains immediate. Applies to live microphone and shared-tab sessions.": "Större värden minskar fragmenterade översättningar för långsamt tal, men översättning och talad ljud kommer senare. Livedeckningen förblir omedelbar. Gäller live-mikrofon- och delade-flik-sessioner."
   },
   "app.title": "PolyTalk - Integritetsfokuserad självhostad översättning",
   "js.error_message": "Fel: {error}",

@@ -56,6 +56,27 @@ class TestWebRouter:
         assert 'id="custom-instruction-count"' in response.text
         assert "Translation Instructions" in response.text
 
+    def test_home_page_includes_session_translation_pacing(self, client):
+        """Advanced settings render bounded pacing from the server default."""
+        with patch("app.routers.web.get_config") as mock_config:
+            mock_config.return_value.app = {
+                "auto_play_audio": True,
+                "translation_flush_seconds": "4.5",
+            }
+            mock_config.return_value.translation = {
+                "custom_instruction_max_chars": 250,
+            }
+
+            response = client.get("/")
+
+        assert response.status_code == 200
+        assert 'id="translation-buffer-seconds"' in response.text
+        assert 'min="1.0"' in response.text
+        assert 'max="10.0"' in response.text
+        assert 'step="0.5"' in response.text
+        assert 'value="4.5"' in response.text
+        assert "The live transcript remains immediate." in response.text
+
     def test_frontend_persists_and_sends_custom_instruction(self):
         """Frontend stores instructions and encodes them on translation sessions."""
         script = (

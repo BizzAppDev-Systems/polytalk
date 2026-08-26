@@ -10,19 +10,26 @@ Provides REST endpoints for audio translation.
 import asyncio
 import json
 import time
-from typing import Optional, AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from fastapi import (
     APIRouter,
+    Header,
+    HTTPException,
+    Response,
     WebSocket,
     WebSocketDisconnect,
+    status,
 )
+from pydantic import BaseModel, Field, field_validator
 
+from ..services.audio_vad import VAD_RESET, VadMode
 from ..services.pipeline_service import TranslationPipelineService
 from ..services.visual_context_service import VisualContextService
 from ..utils.config import get_custom_instruction_max_chars
 from ..utils.logger import get_logger
 from ..utils.sanitize import normalize_instruction
+from ..utils.translation_buffer import clamp_translation_buffer_seconds
 from ..version import __version__
 
 logger = get_logger(__name__)
@@ -31,6 +38,26 @@ router = APIRouter(prefix="/api", tags=["api"])
 
 pipeline_service: Optional[TranslationPipelineService] = None
 visual_context_service: Optional[VisualContextService] = None
+
+
+class TextSpeakRequest(BaseModel):
+    """One bounded selected-text chunk to translate and synthesize."""
+
+    text: str = Field(min_length=1, max_length=500)
+    source_language: str = Field(
+        default="auto", pattern=r"^(?:auto|[a-z]{2,3}(?:_[A-Z]{2})?)$"
+    )
+    target_language: str = Field(pattern=r"^[a-z]{2,3}(?:_[A-Z]{2})?$")
+    sequence: int = Field(default=0, ge=0, le=10000)
+
+    @field_validator("text")
+    @classmethod
+    def normalize_text(cls, value: str) -> str:
+        """Normalize whitespace without retaining or logging the text."""
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("text must not be blank")
+        return normalized
 
 
 def sanitize_custom_instruction(value: str | None) -> str:
@@ -91,13 +118,54 @@ async def health_check() -> dict:
     }
 
 
+@router.post("/text/speak")
+async def text_speak(
+    payload: TextSpeakRequest,
+    translation_routing: str = Header(
+        default="default", alias="X-PolyTalk-Translation-Routing"
+    ),
+) -> Response:
+    """Translate one selected-text chunk and return transient speech audio."""
+    if translation_routing not in {"default", "custom"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid translation routing mode",
+        )
+    result = await get_pipeline_service().translate_text_to_speech(
+        payload.text,
+        payload.source_language,
+        payload.target_language,
+        custom_translation_routing=translation_routing == "custom",
+    )
+    if not result.success:
+        logger.warning("Selected-text translation or speech synthesis failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Text translation or speech synthesis failed",
+        )
+
+    headers = {
+        "Cache-Control": "no-store",
+        "X-PolyTalk-Sequence": str(payload.sequence),
+    }
+    if result.duration is not None:
+        headers["X-PolyTalk-Audio-Duration"] = str(result.duration)
+    return Response(
+        content=result.audio,
+        media_type=result.media_type,
+        headers=headers,
+    )
+
+
 @router.websocket("/ws/translate")
 async def websocket_translate(
     websocket: WebSocket,
     source_language: str = "en",
     target_language: str = "gu",
     mode: str = "live",
+    input_type: str = "microphone",
     custom_instruction: str | None = None,
+    translation_buffer_seconds: float | None = None,
 ):
     """
     WebSocket endpoint for real-time audio translation streaming (2-thread pipeline).
@@ -107,16 +175,43 @@ async def websocket_translate(
         source_language: Source language code
         target_language: Target language code
         mode: Translation mode, either live or conversation.
+        input_type: Browser audio source, either microphone or share.
         custom_instruction: Optional user-provided translation guidance.
+        translation_buffer_seconds: Optional per-session translation context window.
     """
+    routing_mode = (
+        websocket.headers.get("x-polytalk-translation-routing", "default")
+        .strip()
+        .lower()
+    )
+    custom_translation_routing = routing_mode == "custom"
+    if routing_mode not in {"default", "custom"}:
+        logger.warning(
+            "Unknown translation routing mode; using legacy default provider: "
+            f"mode={routing_mode!r}"
+        )
+
     await websocket.accept()
     logger.info(
-        f"WebSocket connection established: {source_language} -> {target_language} mode={mode}"
+        "WebSocket connection established: %s -> %s mode=%s input_type=%s",
+        source_language,
+        target_language,
+        mode,
+        input_type,
     )
 
     if mode not in {"live", "conversation"}:
         await websocket.send_json(
             {"type": "error", "error": "mode must be live or conversation"}
+        )
+        await websocket.close()
+        return
+    if input_type not in {"microphone", "share"}:
+        await websocket.send_json(
+            {
+                "type": "error",
+                "error": "input_type must be microphone or share",
+            }
         )
         await websocket.close()
         return
@@ -128,6 +223,8 @@ async def websocket_translate(
     language_swap_queue = asyncio.Queue()
     visual_context_queue = asyncio.Queue(maxsize=1)
     custom_instruction_queue = asyncio.Queue(maxsize=1)
+    translation_buffer_config_queue = asyncio.Queue(maxsize=1)
+    stt_emit_interval_config_queue = asyncio.Queue(maxsize=1)
     visual_context_tasks: set[asyncio.Task] = set()
     visual_context_in_flight = False
     visual_context_ready = False
@@ -184,9 +281,13 @@ async def websocket_translate(
                         logger.info("Client sent 'end' signal, stopping pipeline")
                         yield b"__END_SIGNAL__"
                         return
+                    elif data.get("type") == "end_of_utterance":
+                        logger.info("Client reported an acoustic pause")
+                        yield b"__END_OF_UTTERANCE__"
                     elif data.get("type") == "pause":
                         is_paused = True
                         pause_event.set()
+                        yield VAD_RESET
                         logger.info(
                             "Client sent 'pause' signal, stopping audio transmission"
                         )
@@ -200,7 +301,7 @@ async def websocket_translate(
                         instruction = sanitize_custom_instruction(
                             data.get("custom_instruction")
                         )
-                        while not custom_instruction_queue.empty():
+                        while True:
                             try:
                                 custom_instruction_queue.get_nowait()
                             except asyncio.QueueEmpty:
@@ -209,6 +310,31 @@ async def websocket_translate(
                         logger.info(
                             "Custom translation instruction updated: "
                             f"chars={len(instruction)}"
+                        )
+                    elif data.get("type") == "translation_buffer_config":
+                        seconds = clamp_translation_buffer_seconds(
+                            data.get("translation_buffer_seconds")
+                        )
+                        if seconds is None:
+                            logger.warning(
+                                "Ignoring invalid translation buffer configuration"
+                            )
+                            continue
+                        while True:
+                            try:
+                                translation_buffer_config_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                        translation_buffer_config_queue.put_nowait(seconds)
+                        while True:
+                            try:
+                                stt_emit_interval_config_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                        stt_emit_interval_config_queue.put_nowait(seconds)
+                        logger.info(
+                            "Session translation/STT pacing updated: "
+                            f"seconds={seconds:.1f}"
                         )
                     elif data.get("type") == "visual_context":
                         image_data_url = data.get("image_data_url") or ""
@@ -279,7 +405,7 @@ async def websocket_translate(
                 )
                 return
 
-            while not visual_context_queue.empty():
+            while True:
                 try:
                     visual_context_queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -287,8 +413,8 @@ async def websocket_translate(
             visual_context_queue.put_nowait(summary)
             visual_context_ready = True
             logger.info(
-                "Visual context summary received: "
-                f"chars={len(summary)} summary={summary[:1200]!r}"
+                "Visual context summary received: chars=%d",
+                len(summary),
             )
             await send_pipeline_status(
                 "visual_context",
@@ -313,6 +439,16 @@ async def websocket_translate(
             "done",
             "Server connected",
         )
+        vad_mode = pipeline.vad.effective_mode(mode, input_type)
+        if vad_mode in {VadMode.BOUNDARY, VadMode.ACTIVE}:
+            await send_result(
+                {
+                    "type": "audio_segmentation",
+                    "mode": vad_mode.value,
+                    "input_type": input_type,
+                    "continuous_audio": True,
+                }
+            )
         await send_pipeline_status(
             "pipeline_warming",
             "active",
@@ -338,11 +474,18 @@ async def websocket_translate(
             source_language,
             target_language,
             mode=mode,
+            input_type=input_type,
             pause_event=pause_event,
             language_swap_queue=language_swap_queue,
             visual_context_queue=visual_context_queue,
             custom_instruction=sanitize_custom_instruction(custom_instruction),
             custom_instruction_queue=custom_instruction_queue,
+            translation_buffer_seconds=clamp_translation_buffer_seconds(
+                translation_buffer_seconds
+            ),
+            translation_buffer_config_queue=translation_buffer_config_queue,
+            stt_emit_interval_config_queue=stt_emit_interval_config_queue,
+            custom_translation_routing=custom_translation_routing,
         ):
             if client_disconnected:
                 logger.info("Client disconnected, stopping pipeline")

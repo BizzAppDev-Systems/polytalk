@@ -32,6 +32,7 @@ class PolyTalkApp {
         this.visualContextSent = false;
 
         this.initElements();
+        this.loadSavedTranslationBuffer();
         this.applyLanguageParamsToView();
         this.initEventListeners();
         this.updateUIState('ready');
@@ -95,6 +96,8 @@ class PolyTalkApp {
         this.outputDeviceSelect = document.getElementById('output-device-select');
         this.customInstructionInput = document.getElementById('custom-instruction-input');
         this.customInstructionCount = document.getElementById('custom-instruction-count');
+        this.translationBufferSeconds = document.getElementById('translation-buffer-seconds');
+        this.translationBufferValueNumber = document.getElementById('translation-buffer-value-number');
         this.status = document.getElementById('status');
         this.recordingIndicator = document.getElementById('recording-indicator');
         this.transcript = document.getElementById('transcript');
@@ -200,6 +203,20 @@ class PolyTalkApp {
             });
             this.customInstructionInput.addEventListener('drop', () => {
                 window.setTimeout(() => this.enforceCustomInstructionMaxLength(), 0);
+            });
+        }
+        if (this.translationBufferSeconds) {
+            this.translationBufferSeconds.addEventListener('input', () => {
+                this.updateTranslationBufferLabel();
+                window.clearTimeout(this.translationBufferConfigTimer);
+                this.translationBufferConfigTimer = window.setTimeout(() => {
+                    if (this.ws?.readyState === WebSocket.OPEN) {
+                        this.ws.send(JSON.stringify({
+                            type: 'translation_buffer_config',
+                            translation_buffer_seconds: this.getTranslationBufferSeconds()
+                        }));
+                    }
+                }, 250);
             });
         }
         const saveSettingsBtn = document.getElementById('save-settings-btn');
@@ -434,6 +451,7 @@ class PolyTalkApp {
         const inputDeviceId = this.inputDeviceSelect?.value || 'default';
         const outputDeviceId = this.outputDeviceSelect?.value || 'default';
         const customInstruction = this.getCustomInstruction();
+        const translationBufferSeconds = this.getTranslationBufferSeconds();
         if (this.customInstructionInput) {
             this.customInstructionInput.value = customInstruction;
             this.updateCustomInstructionCount();
@@ -442,6 +460,17 @@ class PolyTalkApp {
         localStorage.setItem('polytalk_input_device', inputDeviceId);
         localStorage.setItem('polytalk_output_device', outputDeviceId);
         localStorage.setItem('polytalk_custom_instruction', customInstruction);
+        localStorage.setItem(
+            'polytalk_translation_buffer_seconds',
+            String(translationBufferSeconds)
+        );
+
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+                type: 'translation_buffer_config',
+                translation_buffer_seconds: translationBufferSeconds
+            }));
+        }
 
         this.audioRecorder.selectedDeviceId = inputDeviceId;
         this.audioRecorder.setOutputDeviceId(outputDeviceId);
@@ -482,6 +511,53 @@ class PolyTalkApp {
 
         this.customInstructionInput.value = localStorage.getItem('polytalk_custom_instruction') || '';
         this.enforceCustomInstructionMaxLength();
+    }
+
+    /**
+     * Restore the locally saved per-session translation context window.
+     */
+    loadSavedTranslationBuffer() {
+        if (!this.translationBufferSeconds) return;
+
+        const savedValue = localStorage.getItem('polytalk_translation_buffer_seconds');
+        if (savedValue !== null) {
+            this.translationBufferSeconds.value = String(
+                this.clampTranslationBufferSeconds(savedValue)
+            );
+        }
+        this.updateTranslationBufferLabel();
+    }
+
+    /**
+     * Bound translation pacing using the limits rendered by the server.
+     */
+    clampTranslationBufferSeconds(value) {
+        const minimum = Number(this.translationBufferSeconds?.min || 1);
+        const maximum = Number(this.translationBufferSeconds?.max || 10);
+        const seconds = Number(value);
+        if (!Number.isFinite(seconds)) {
+            return Number(this.translationBufferSeconds?.value || minimum);
+        }
+        return Math.min(maximum, Math.max(minimum, seconds));
+    }
+
+    /**
+     * Return the translation context window selected for the next session.
+     */
+    getTranslationBufferSeconds() {
+        return this.clampTranslationBufferSeconds(
+            this.translationBufferSeconds?.value
+        );
+    }
+
+    /**
+     * Keep the visible slider value in sync with the range input.
+     */
+    updateTranslationBufferLabel() {
+        if (!this.translationBufferValueNumber) return;
+
+        const seconds = this.getTranslationBufferSeconds();
+        this.translationBufferValueNumber.textContent = seconds.toFixed(1);
     }
 
     /**
@@ -570,6 +646,12 @@ class PolyTalkApp {
         const customInstruction = this.getCustomInstruction();
         if (customInstruction) {
             params.set('custom_instruction', customInstruction);
+        }
+        if (mode !== 'conversation') {
+            params.set(
+                'translation_buffer_seconds',
+                String(this.getTranslationBufferSeconds())
+            );
         }
 
         return `${protocol}//${window.location.host}/api/ws/translate?${params.toString()}`;

@@ -24,6 +24,7 @@ import httpx
 from .base import BaseTTSService, TTSResult
 from ..config import get_config
 from ..utils.logger import get_logger
+from ..utils.sanitize import normalize_tts_text
 
 logger = get_logger(__name__)
 
@@ -43,6 +44,7 @@ class TTSService(BaseTTSService):
         self.enabled = self.config.get("enabled", True)
         self.mock_mode = self.config.get("mock_mode", True)
         self.provider = self.config.get("provider", "piper")
+        self.fallback_provider = self.config.get("fallback_provider", self.provider)
         self.base_url = self.config.get("base_url", "http://localhost:5000")
         self.providers = self.config.get("providers", {})
         self.language_providers = self.config.get("language_providers", {})
@@ -92,16 +94,50 @@ class TTSService(BaseTTSService):
             logger.info("Using mock TTS")
             return await self._mock_synthesize(text, language, output_path)
 
+        provider = self._get_provider_for_language(language)
         try:
-            provider = self._get_provider_for_language(language)
-            if provider == "piper":
-                return await self._piper_synthesize(text, language, output_path)
-            if provider == "supertonic":
-                return await self._supertonic_synthesize(text, language, output_path)
-            return await self._openai_synthesize(text, language, output_path)
-        except Exception as e:
-            logger.error(f"TTS synthesis failed: {e}")
-            return TTSResult(success=False, error=str(e))
+            result = await self._synthesize_with_provider(
+                provider, text, language, output_path
+            )
+        except Exception as exc:
+            logger.error(f"TTS synthesis failed: provider={provider} error={exc}")
+            result = TTSResult(success=False, error=str(exc))
+
+        if not result.success and provider != self.fallback_provider:
+            logger.warning(
+                "TTS provider failed; using fallback: "
+                f"selected={provider} fallback={self.fallback_provider} "
+                f"language={language} error={result.error}"
+            )
+            try:
+                return await self._synthesize_with_provider(
+                    self.fallback_provider, text, language, output_path
+                )
+            except Exception as exc:
+                return TTSResult(
+                    success=False,
+                    error=(
+                        f"{provider} failed ({result.error}); "
+                        f"{self.fallback_provider} fallback failed ({exc})"
+                    ),
+                )
+        return result
+
+    async def _synthesize_with_provider(
+        self,
+        provider: str,
+        text: str,
+        language: str,
+        output_path: Optional[Path],
+    ) -> TTSResult:
+        """Dispatch synthesis while keeping provider formats out of the pipeline."""
+        if provider == "piper":
+            return await self._piper_synthesize(text, language, output_path)
+        if provider == "supertonic":
+            return await self._supertonic_synthesize(text, language, output_path)
+        if provider == "indic_parler":
+            return await self._indic_parler_synthesize(text, language, output_path)
+        return await self._openai_synthesize(text, language, output_path)
 
     async def _mock_synthesize(
         self, text: str, language: str, output_path: Optional[Path] = None
@@ -408,6 +444,7 @@ class TTSService(BaseTTSService):
         normalized_language, lang_base = self._normalize_language(language)
         voice = self._get_supertonic_voice_for_language(language)
         url = self._get_provider_base_url("supertonic") + "/v1/tts"
+        text = normalize_tts_text(text)
 
         payload = {
             "text": text,
@@ -456,6 +493,85 @@ class TTSService(BaseTTSService):
                 success=False,
                 error=f"Supertonic TTS HTTP error: {e}",
             )
+
+    async def _indic_parler_synthesize(
+        self, text: str, language: str, output_path: Optional[Path] = None
+    ) -> TTSResult:
+        """Synthesize WAV audio through the local Indic Parler service."""
+        provider_config = self._get_provider_config("indic_parler")
+        normalized_language, lang_base = self._normalize_language(language)
+        genders = provider_config.get("genders", {})
+        voices = provider_config.get("voices", {})
+        gender = genders.get(
+            normalized_language,
+            genders.get(lang_base, provider_config.get("gender", "female")),
+        )
+        voice = voices.get(
+            normalized_language,
+            voices.get(lang_base, provider_config.get("voice", "auto")),
+        )
+        paces = provider_config.get("paces", {})
+        pace = paces.get(
+            normalized_language,
+            paces.get(lang_base, provider_config.get("pace", "moderate")),
+        )
+        speeds = provider_config.get("speeds", {})
+        speed = self._config_float(
+            speeds.get(
+                normalized_language,
+                speeds.get(lang_base, provider_config.get("speed", 1.0)),
+            ),
+            1.0,
+        )
+        payload = {
+            "text": normalize_tts_text(text),
+            "lang": lang_base,
+            "gender": gender,
+            "voice": voice,
+            "pace": pace,
+            "speed": speed,
+        }
+        description = provider_config.get("description")
+        if description:
+            payload["description"] = description
+
+        url = self._get_provider_base_url("indic_parler") + "/v1/tts"
+        timeout = self._config_float(provider_config.get("timeout_seconds"), 180.0)
+        try:
+            response = await self._http_client.post(url, json=payload, timeout=timeout)
+            response.raise_for_status()
+            audio_content = response.content
+            if not audio_content:
+                return TTSResult(
+                    success=False,
+                    error="Indic Parler TTS returned an empty response",
+                )
+        except httpx.HTTPError as exc:
+            logger.error("Indic Parler TTS HTTP error: %s", exc)
+            return TTSResult(
+                success=False,
+                error=f"Indic Parler TTS HTTP error: {exc}",
+            )
+
+        if output_path is None:
+            unique_id = str(uuid.uuid4())[:8]
+            output_path = self.media_dir / f"tts_{normalized_language}_{unique_id}.wav"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as output_file:
+            output_file.write(audio_content)
+
+        logger.info(
+            "Indic Parler TTS generated: %s (lang: %s, gender: %s, voice: %s)",
+            output_path,
+            lang_base,
+            gender,
+            voice,
+        )
+        return TTSResult(
+            audio_path=output_path,
+            audio_url=f"/media/output/{output_path.name}",
+            success=True,
+        )
 
     async def _openai_synthesize(
         self, text: str, language: str, output_path: Optional[Path] = None

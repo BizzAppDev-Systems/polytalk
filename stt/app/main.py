@@ -1,20 +1,21 @@
 # SPDX-FileCopyrightText: 2026 BizzAppDev Systems Pvt. Ltd.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-import os
-import time
 import asyncio
 import io
 import json
 import logging
 import math
+import os
 import sys
+import time
+import unicodedata
 import wave
 from array import array
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Optional
 
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from faster_whisper import WhisperModel
 
@@ -77,6 +78,13 @@ CONDITION_ON_PREVIOUS_TEXT = (
 )
 TEMPERATURE = float(os.environ.get("STT_TEMPERATURE", "0.0"))
 INITIAL_PROMPT = os.environ.get("STT_INITIAL_PROMPT") or None
+CANDIDATE_LANGUAGE_CONFIDENCE = float(
+    os.environ.get("STT_CANDIDATE_LANGUAGE_CONFIDENCE", "0.70")
+)
+MAX_CANDIDATE_DECODES = max(1, int(os.environ.get("STT_MAX_CANDIDATE_DECODES", "3")))
+CANDIDATE_SCRIPT_SCORE_WEIGHT = float(
+    os.environ.get("STT_CANDIDATE_SCRIPT_SCORE_WEIGHT", "1.50")
+)
 MAX_STREAM_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 WORD_OVERLAP_STRIP_CHARS = " \t\r\n.,!?;:…\"'()[]{}"
 MAX_ADJACENT_PHRASE_REPEATS = 2
@@ -112,6 +120,8 @@ class TranscribeJob:
     queue_depth_at_enqueue: int
     backpressure_seconds: float = 0.0
     force_emit: bool = False
+    upstream_vad: bool = False
+    finalization_reason: Optional[str] = None
 
 
 @dataclass
@@ -132,6 +142,7 @@ class TranscribeResult:
     queue_depth_at_enqueue: int = 0
     backpressure_seconds: float = 0.0
     force_emit: bool = False
+    finalization_reason: Optional[str] = None
 
 
 def _get_model() -> WhisperModel:
@@ -166,6 +177,99 @@ def _normalize_candidate_languages(value: object) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+LANGUAGE_SCRIPT_NAMES = {
+    "ar": ("ARABIC",),
+    "as": ("BENGALI",),
+    "bn": ("BENGALI",),
+    "brx": ("DEVANAGARI",),
+    "bg": ("CYRILLIC",),
+    "el": ("GREEK",),
+    "gu": ("GUJARATI",),
+    "hi": ("DEVANAGARI",),
+    "ja": ("HIRAGANA", "KATAKANA", "CJK"),
+    "kn": ("KANNADA",),
+    "ko": ("HANGUL",),
+    "ml": ("MALAYALAM",),
+    "mni": ("MEETEI MAYEK", "BENGALI"),
+    "mr": ("DEVANAGARI",),
+    "or": ("ORIYA",),
+    "pa": ("GURMUKHI",),
+    "ru": ("CYRILLIC",),
+    "ta": ("TAMIL",),
+    "te": ("TELUGU",),
+    "uk": ("CYRILLIC",),
+    "ur": ("ARABIC",),
+    "zh": ("CJK", "BOPOMOFO"),
+}
+LATIN_SCRIPT_LANGUAGES = {
+    "cs",
+    "da",
+    "de",
+    "en",
+    "es",
+    "et",
+    "fi",
+    "fr",
+    "hr",
+    "hu",
+    "id",
+    "it",
+    "lt",
+    "lv",
+    "nl",
+    "pl",
+    "pt",
+    "ro",
+    "sk",
+    "sl",
+    "sv",
+    "tr",
+    "vi",
+}
+
+
+def _language_script_match_ratio(text: str, language: str) -> Optional[float]:
+    """Return the share of letters matching a language's expected script."""
+    script_names = LANGUAGE_SCRIPT_NAMES.get(language)
+    if script_names is None and language in LATIN_SCRIPT_LANGUAGES:
+        script_names = ("LATIN",)
+    if script_names is None:
+        return None
+
+    letters = [char for char in text if unicodedata.category(char).startswith("L")]
+    if not letters:
+        return None
+    matches = sum(
+        any(script_name in unicodedata.name(char, "") for script_name in script_names)
+        for char in letters
+    )
+    return matches / len(letters)
+
+
+def _collect_transcription_segments(segments) -> tuple[str, bool, float]:
+    """Collect accepted Whisper segments and their text-weighted log probability."""
+    text_parts: list[str] = []
+    weighted_logprob = 0.0
+    total_weight = 0
+    for segment in segments:
+        no_speech_prob = getattr(segment, "no_speech_prob", 0.0)
+        avg_logprob = getattr(segment, "avg_logprob", 0.0)
+        if (
+            no_speech_prob >= NO_SPEECH_PROB_THRESHOLD
+            or avg_logprob <= LOG_PROB_THRESHOLD
+        ):
+            continue
+        text = segment.text
+        if text.strip():
+            text_parts.append(text)
+            weight = max(1, len(text.strip()))
+            weighted_logprob += avg_logprob * weight
+            total_weight += weight
+    transcript = "".join(text_parts)
+    mean_logprob = weighted_logprob / total_weight if total_weight else float("-inf")
+    return transcript, bool(text_parts), mean_logprob
+
+
 def _calculate_rms(audio_bytes: bytes) -> float:
     """Return normalized RMS for signed 16-bit PCM audio."""
     if len(audio_bytes) < SAMPLE_WIDTH_BYTES:
@@ -184,8 +288,20 @@ def _calculate_rms(audio_bytes: bytes) -> float:
     return math.sqrt(square_sum / len(samples)) / 32768.0
 
 
-def _transcribe_audio(model: WhisperModel, wav_buffer: io.BytesIO, language, task):
-    """Run blocking Whisper transcription and collect accepted segments."""
+def _transcribe_audio(
+    model: WhisperModel,
+    wav_buffer: io.BytesIO,
+    language: Optional[str],
+    task: str,
+    candidate_languages: tuple[str, ...] = (),
+):
+    """Run blocking Whisper transcription and collect accepted segments.
+
+    When no explicit language is supplied, conversation mode can provide a
+    bounded candidate set. Confident in-set detections use the fast path;
+    ambiguous or out-of-set detections decode both selected languages and
+    choose using transcription likelihood and script consistency.
+    """
     vad_parameters = None
     if VAD_FILTER:
         vad_parameters = {
@@ -193,35 +309,101 @@ def _transcribe_audio(model: WhisperModel, wav_buffer: io.BytesIO, language, tas
             "speech_pad_ms": VAD_SPEECH_PAD_MS,
         }
 
-    segments, info = model.transcribe(
-        wav_buffer,
-        language=language,
-        task=task,
-        vad_filter=VAD_FILTER,
-        vad_parameters=vad_parameters,
-        word_timestamps=WORD_TIMESTAMPS,
-        condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
-        temperature=TEMPERATURE,
-        no_speech_threshold=NO_SPEECH_PROB_THRESHOLD,
-        log_prob_threshold=LOG_PROB_THRESHOLD,
-        initial_prompt=INITIAL_PROMPT,
+    def run_transcription(language_hint):
+        return model.transcribe(
+            wav_buffer,
+            language=language_hint,
+            task=task,
+            vad_filter=VAD_FILTER,
+            vad_parameters=vad_parameters,
+            word_timestamps=WORD_TIMESTAMPS,
+            condition_on_previous_text=CONDITION_ON_PREVIOUS_TEXT,
+            temperature=TEMPERATURE,
+            no_speech_threshold=NO_SPEECH_PROB_THRESHOLD,
+            log_prob_threshold=LOG_PROB_THRESHOLD,
+            initial_prompt=INITIAL_PROMPT,
+        )
+
+    normalized_candidates = tuple(
+        dict.fromkeys(
+            normalized
+            for candidate in candidate_languages
+            if (normalized := _normalize_language_code(candidate))
+        )
     )
-
-    transcript = ""
-    has_speech = False
-    for segment in segments:
-        no_speech_prob = getattr(segment, "no_speech_prob", 0.0)
-        avg_logprob = getattr(segment, "avg_logprob", 0.0)
+    if not language and normalized_candidates:
+        detection_segments, detection_info = run_transcription(None)
+        probabilities = {
+            _normalize_language_code(code): float(probability)
+            for code, probability in (
+                getattr(detection_info, "all_language_probs", None) or []
+            )
+            if _normalize_language_code(code)
+        }
+        selected_language = max(
+            normalized_candidates,
+            key=lambda candidate: probabilities.get(candidate, float("-inf")),
+        )
+        detected_language = _normalize_language_code(
+            getattr(detection_info, "language", None)
+        )
+        detected_confidence = probabilities.get(
+            detected_language,
+            float(getattr(detection_info, "language_probability", 0.0) or 0.0),
+        )
         if (
-            no_speech_prob >= NO_SPEECH_PROB_THRESHOLD
-            or avg_logprob <= LOG_PROB_THRESHOLD
+            detected_language in normalized_candidates
+            and detected_confidence >= CANDIDATE_LANGUAGE_CONFIDENCE
         ):
-            continue
+            transcript, has_speech, _ = _collect_transcription_segments(
+                detection_segments
+            )
+            logger.info(
+                "Conversation language fast-path selected %s (confidence=%.3f)",
+                detected_language,
+                detected_confidence,
+            )
+            return transcript, has_speech, detected_language
 
-        if segment.text.strip():
-            transcript += segment.text
-            has_speech = True
+        best_result = ("", False, selected_language)
+        best_score = float("-inf")
+        candidate_scores: dict[str, float] = {}
+        if len(normalized_candidates) <= MAX_CANDIDATE_DECODES:
+            decode_candidates = normalized_candidates
+        else:
+            # Preserve the caller's selected-language order. Auto-detection is
+            # intentionally not used to discard candidates because it is least
+            # reliable on the ambiguous windows handled by this branch.
+            decode_candidates = normalized_candidates[:MAX_CANDIDATE_DECODES]
+        for candidate in decode_candidates:
+            wav_buffer.seek(0)
+            candidate_segments, _candidate_info = run_transcription(candidate)
+            transcript, has_speech, mean_logprob = _collect_transcription_segments(
+                candidate_segments
+            )
+            score = mean_logprob
+            script_ratio = _language_script_match_ratio(transcript, candidate)
+            if script_ratio is not None:
+                score += (script_ratio - 0.5) * CANDIDATE_SCRIPT_SCORE_WEIGHT
+            candidate_scores[candidate] = score
+            if has_speech and score > best_score:
+                best_score = score
+                best_result = (transcript, True, candidate)
 
+        logger.info(
+            "Conversation language candidate decode selected %s "
+            "(detected=%s, confidence=%.3f, candidates=%s, scores=%s)",
+            best_result[2],
+            detected_language,
+            detected_confidence,
+            decode_candidates,
+            {key: round(value, 3) for key, value in candidate_scores.items()},
+        )
+        return best_result
+    else:
+        segments, info = run_transcription(language)
+
+    transcript, has_speech, _ = _collect_transcription_segments(segments)
     return transcript, has_speech, getattr(info, "language", None)
 
 
@@ -289,7 +471,7 @@ def _process_transcribe_job(
         else 0.0
     )
     audio_rms = _calculate_rms(job.audio_bytes)
-    if audio_rms < SILENCE_RMS_THRESHOLD:
+    if not job.upstream_vad and audio_rms < SILENCE_RMS_THRESHOLD:
         completed_at = time.time()
         return TranscribeResult(
             sequence=job.sequence,
@@ -302,6 +484,7 @@ def _process_transcribe_job(
             queue_depth_at_enqueue=job.queue_depth_at_enqueue,
             backpressure_seconds=job.backpressure_seconds,
             force_emit=job.force_emit,
+            finalization_reason=job.finalization_reason,
         )
 
     transcript, has_speech, detected_language = _transcribe_audio(
@@ -309,6 +492,7 @@ def _process_transcribe_job(
         _build_wav_buffer(job.audio_bytes),
         job.language,
         job.task,
+        job.candidate_languages,
     )
     completed_at = time.time()
     return TranscribeResult(
@@ -324,6 +508,7 @@ def _process_transcribe_job(
         queue_depth_at_enqueue=job.queue_depth_at_enqueue,
         backpressure_seconds=job.backpressure_seconds,
         force_emit=job.force_emit,
+        finalization_reason=job.finalization_reason,
     )
 
 
@@ -349,6 +534,7 @@ def _result_metrics(
         "skipped_silence": result.skipped_silence,
         "has_speech": result.has_speech,
         "force_emit": result.force_emit,
+        "finalization_reason": result.finalization_reason,
     }
 
 
@@ -528,6 +714,10 @@ async def stream_transcription(
     current_candidate_languages: tuple[str, ...] = ()
     current_task = task
     current_emit_policy = "live"
+    # Legacy clients remain on transport/RMS gating. WebSocket ordering ensures
+    # an upstream_vad control is applied before any later binary audio message.
+    current_input_segmentation = "transport_vad"
+    current_emit_interval_seconds = EMIT_INTERVAL_SECONDS
     audio_chunks = []
     total_size = 0
     next_sequence = 0
@@ -543,6 +733,9 @@ async def stream_transcription(
             current_candidate_languages, \
             current_task, \
             current_emit_policy, \
+            current_input_segmentation, \
+            current_emit_interval_seconds, \
+            min_chunk_bytes, \
             total_size, \
             next_sequence
         current_window_has_voice = False
@@ -559,7 +752,9 @@ async def stream_transcription(
         pause_flush_bytes -= pause_flush_bytes % SAMPLE_WIDTH_BYTES
 
         async def enqueue_audio_window(
-            audio_bytes: bytes, force_emit: bool = False
+            audio_bytes: bytes,
+            force_emit: bool = False,
+            finalization_reason: Optional[str] = None,
         ) -> bool:
             nonlocal current_window_has_voice, next_sequence, trailing_silence_bytes
             enqueue_started_at = time.time()
@@ -592,6 +787,8 @@ async def stream_transcription(
                 queue_depth_at_enqueue=queue_depth_before,
                 backpressure_seconds=queued_at - enqueue_started_at,
                 force_emit=force_emit,
+                upstream_vad=current_input_segmentation == "upstream_vad",
+                finalization_reason=finalization_reason,
             )
             if stop_event.is_set():
                 return False
@@ -615,7 +812,8 @@ async def stream_transcription(
                 overlap_audio = audio_bytes[-overlap_bytes:]
                 audio_chunks[:] = [overlap_audio]
                 current_window_has_voice = (
-                    _calculate_rms(overlap_audio) >= SILENCE_RMS_THRESHOLD
+                    current_input_segmentation == "upstream_vad"
+                    or _calculate_rms(overlap_audio) >= SILENCE_RMS_THRESHOLD
                 )
                 trailing_silence_bytes = (
                     0 if current_window_has_voice else len(overlap_audio)
@@ -632,6 +830,7 @@ async def stream_transcription(
                     if (
                         current_emit_policy == "pause"
                         and current_window_has_voice
+                        and current_input_segmentation != "upstream_vad"
                         and IDLE_FLUSH_SECONDS > 0
                     ):
                         data = await asyncio.wait_for(
@@ -642,7 +841,9 @@ async def stream_transcription(
                 except asyncio.TimeoutError:
                     audio_bytes = b"".join(audio_chunks)
                     if audio_bytes and not await enqueue_audio_window(
-                        audio_bytes, force_emit=True
+                        audio_bytes,
+                        force_emit=True,
+                        finalization_reason="idle_pause",
                     ):
                         break
                     continue
@@ -657,6 +858,28 @@ async def stream_transcription(
                     except json.JSONDecodeError:
                         continue
 
+                    if message.get("type") == "end":
+                        audio_bytes = b"".join(audio_chunks)
+                        if audio_bytes:
+                            await enqueue_audio_window(
+                                audio_bytes,
+                                force_emit=True,
+                                finalization_reason="end",
+                            )
+                        stop_event.set()
+                        break
+                    if message.get("type") == "flush":
+                        audio_bytes = b"".join(audio_chunks)
+                        reason = message.get("reason")
+                        if reason not in {"client_flush", "vad_pause"}:
+                            reason = "client_flush"
+                        if audio_bytes:
+                            await enqueue_audio_window(
+                                audio_bytes,
+                                force_emit=True,
+                                finalization_reason=reason,
+                            )
+                        continue
                     if message.get("language"):
                         current_language = message["language"]
                     if message.get("task") in {"transcribe", "translate"}:
@@ -681,6 +904,31 @@ async def stream_transcription(
                                 "emit_policy": current_emit_policy,
                             }
                         )
+                    if message.get("input_segmentation") == "upstream_vad":
+                        current_input_segmentation = "upstream_vad"
+                        await websocket.send_json(
+                            {
+                                "type": "input_segmentation_ack",
+                                "input_segmentation": current_input_segmentation,
+                            }
+                        )
+                    if "emit_interval_seconds" in message:
+                        try:
+                            seconds = float(message["emit_interval_seconds"])
+                        except (TypeError, ValueError):
+                            seconds = None
+                        if seconds is not None and math.isfinite(seconds):
+                            current_emit_interval_seconds = min(30.0, max(1.0, seconds))
+                            min_chunk_bytes = int(
+                                current_emit_interval_seconds * bytes_per_second
+                            )
+                            min_chunk_bytes -= min_chunk_bytes % SAMPLE_WIDTH_BYTES
+                            await websocket.send_json(
+                                {
+                                    "type": "emit_interval_ack",
+                                    "emit_interval_seconds": current_emit_interval_seconds,
+                                }
+                            )
                     continue
 
                 if "bytes" not in data:
@@ -706,7 +954,10 @@ async def stream_transcription(
                 total_size += len(audio_data)
 
                 audio_rms = _calculate_rms(audio_data)
-                has_voice = audio_rms >= SILENCE_RMS_THRESHOLD
+                has_voice = (
+                    current_input_segmentation == "upstream_vad"
+                    or audio_rms >= SILENCE_RMS_THRESHOLD
+                )
 
                 if not current_window_has_voice and not has_voice:
                     leading_silence_preroll_total_bytes = _append_bounded_audio_preroll(
@@ -748,7 +999,11 @@ async def stream_transcription(
                 )
                 if should_flush_for_size or should_flush_for_pause:
                     if not await enqueue_audio_window(
-                        audio_bytes, force_emit=should_flush_for_pause
+                        audio_bytes,
+                        force_emit=should_flush_for_pause,
+                        finalization_reason=(
+                            "pause" if should_flush_for_pause else None
+                        ),
                     ):
                         break
         except WebSocketDisconnect:
@@ -794,6 +1049,7 @@ async def stream_transcription(
                 result.queue_depth_at_enqueue = job.queue_depth_at_enqueue
                 result.backpressure_seconds = job.backpressure_seconds
                 result.force_emit = job.force_emit
+                result.finalization_reason = job.finalization_reason
 
             metrics = _result_metrics(result)
             logger.debug(
@@ -933,7 +1189,7 @@ async def stream_transcription(
                         current_emit_policy == "live"
                         and (
                             len(pending_transcript) >= EMIT_MIN_CHARS
-                            or now - last_emit_time >= EMIT_INTERVAL_SECONDS
+                            or now - last_emit_time >= current_emit_interval_seconds
                         )
                     )
 

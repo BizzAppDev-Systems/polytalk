@@ -52,6 +52,9 @@ docker run -p 8000:8000 polytalk-stt
 | `STT_SILENCE_RMS_THRESHOLD` | `0.003` | Skip model inference for very quiet audio windows. Raise this if Whisper hallucinates during silence. |
 | `STT_NO_SPEECH_PROB_THRESHOLD` | `0.50` | Drop segments classified as likely no-speech by faster-whisper. |
 | `STT_LOG_PROB_THRESHOLD` | `-1.0` | Drop low-confidence faster-whisper segments. |
+| `STT_CANDIDATE_LANGUAGE_CONFIDENCE` | `0.70` | In conversation mode, trust an in-pair auto-detection only at or above this probability; otherwise decode both selected languages. |
+| `STT_MAX_CANDIDATE_DECODES` | `3` | Maximum explicit Whisper decodes for an ambiguous audio window. Normal conversation mode supplies only the selected source and target; the cap bounds malformed or future larger candidate lists. |
+| `STT_CANDIDATE_SCRIPT_SCORE_WEIGHT` | `1.50` | Weight expected-script consistency when selecting between ambiguous conversation-language decodes. |
 | `STT_MAX_CROSS_DELTA_WORD_REPEATS` | `6` | Stop appending the same leading word across transcript updates after this many existing repeats. |
 | `STT_VAD_FILTER` | `true` | Enable faster-whisper VAD before decoding. |
 | `STT_VAD_MIN_SILENCE_MS` | `500` | Silence duration used by VAD to split speech. Raise for fewer, larger speech regions. |

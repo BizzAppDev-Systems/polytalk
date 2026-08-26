@@ -36,6 +36,9 @@
                     <div class="language-select-wrapper">
                         <select id="source-lang" name="source_language">
                             <option value="ar">Arabic</option>
+                            <option value="as">Assamese</option>
+                            <option value="bn">Bengali</option>
+                            <option value="brx">Bodo</option>
                             <option value="bg">Bulgarian</option>
                             <option value="zh">Chinese</option>
                             <option value="hr">Croatian</option>
@@ -55,12 +58,17 @@
                             <option value="id">Indonesian</option>
                             <option value="it">Italian</option>
                             <option value="ja">Japanese</option>
+                            <option value="kn">Kannada</option>
                             <option value="ko">Korean</option>
                             <option value="lv">Latvian</option>
                             <option value="lt">Lithuanian</option>
                             <option value="ml">Malayalam</option>
+                            <option value="mni">Manipuri</option>
+                            <option value="mr">Marathi</option>
+                            <option value="or">Odia</option>
                             <option value="pl">Polish</option>
                             <option value="pt">Portuguese</option>
+                            <option value="pa">Punjabi</option>
                             <option value="ro">Romanian</option>
                             <option value="ru">Russian</option>
                             <option value="sk">Slovak</option>
@@ -68,14 +76,12 @@
                             <option value="es">Spanish</option>
                             <option value="es_MX">Spanish (Mexico)</option>
                             <option value="sv">Swedish</option>
+                            <option value="ta">Tamil</option>
+                            <option value="te">Telugu</option>
                             <option value="tr">Turkish</option>
                             <option value="uk">Ukrainian</option>
+                            <option value="ur">Urdu</option>
                             <option value="vi">Vietnamese</option>
-                            <option value="bn" disabled>Bengali</option>
-                            <option value="kn" disabled>Kannada</option>
-                            <option value="mr" disabled>Marathi</option>
-                            <option value="ta" disabled>Tamil</option>
-                            <option value="te" disabled>Telugu</option>
                         </select>
                     </div>
                 </div>
@@ -89,6 +95,9 @@
                     <div class="language-select-wrapper">
                         <select id="target-lang" name="target_language">
                             <option value="ar">Arabic</option>
+                            <option value="as">Assamese</option>
+                            <option value="bn">Bengali</option>
+                            <option value="brx">Bodo</option>
                             <option value="bg">Bulgarian</option>
                             <option value="zh">Chinese</option>
                             <option value="hr">Croatian</option>
@@ -108,12 +117,17 @@
                             <option value="id">Indonesian</option>
                             <option value="it">Italian</option>
                             <option value="ja">Japanese</option>
+                            <option value="kn">Kannada</option>
                             <option value="ko">Korean</option>
                             <option value="lv">Latvian</option>
                             <option value="lt">Lithuanian</option>
                             <option value="ml">Malayalam</option>
+                            <option value="mni">Manipuri</option>
+                            <option value="mr">Marathi</option>
+                            <option value="or">Odia</option>
                             <option value="pl">Polish</option>
                             <option value="pt">Portuguese</option>
+                            <option value="pa">Punjabi</option>
                             <option value="ro">Romanian</option>
                             <option value="ru">Russian</option>
                             <option value="sk">Slovak</option>
@@ -121,14 +135,12 @@
                             <option value="es">Spanish</option>
                             <option value="es_MX">Spanish (Mexico)</option>
                             <option value="sv">Swedish</option>
+                            <option value="ta">Tamil</option>
+                            <option value="te">Telugu</option>
                             <option value="tr">Turkish</option>
                             <option value="uk">Ukrainian</option>
+                            <option value="ur">Urdu</option>
                             <option value="vi">Vietnamese</option>
-                            <option value="bn" disabled>Bengali</option>
-                            <option value="kn" disabled>Kannada</option>
-                            <option value="mr" disabled>Marathi</option>
-                            <option value="ta" disabled>Tamil</option>
-                            <option value="te" disabled>Telugu</option>
                         </select>
                     </div>
                 </div>
@@ -251,6 +263,27 @@
                             <div class="settings-char-count" id="custom-instruction-count" aria-live="polite">0/{{ custom_instruction_max_chars }}</div>
                         </div>
                         <p class="settings-note">Optional guidance sent with live, conversation, and tab-audio translation sessions.</p>
+                    </div>
+                    <div class="settings-section">
+                        <h3>Advanced Translation Pacing</h3>
+                        <div class="settings-field">
+                            <label for="translation-buffer-seconds">
+                                Context window:
+                                <strong id="translation-buffer-value"><span id="translation-buffer-value-number">{{ translation_buffer_seconds }}</span> <span id="translation-buffer-unit">seconds</span></strong>
+                            </label>
+                            <input
+                                id="translation-buffer-seconds"
+                                type="range"
+                                min="{{ translation_buffer_seconds_min }}"
+                                max="{{ translation_buffer_seconds_max }}"
+                                step="{{ translation_buffer_seconds_step }}"
+                                value="{{ translation_buffer_seconds }}"
+                                aria-describedby="translation-buffer-note"
+                            >
+                        </div>
+                        <p class="settings-note settings-warning" id="translation-buffer-note">
+                            Larger values reduce fragmented translations for slow speech, but translation and spoken audio arrive later. The live transcript remains immediate. Applies to live microphone and shared-tab sessions.
+                        </p>
                     </div>
                 </div>
                 <div class="settings-footer">

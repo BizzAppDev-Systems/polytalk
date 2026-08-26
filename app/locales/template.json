@@ -175,7 +175,11 @@
     "AI Behavior": "",
     "Translation Instructions": "",
     "Translate formally. Keep technical terms in English.": "",
-    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": ""
+    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "",
+    "Advanced Translation Pacing": "",
+    "Context window:": "",
+    "seconds": "",
+    "Larger values reduce fragmented translations for slow speech, but translation and spoken audio arrive later. The live transcript remains immediate. Applies to live microphone and shared-tab sessions.": ""
   },
   "app.title": "",
   "js.error_message": "Error: {error}",

@@ -217,6 +217,11 @@ translation:
   context_payload_warn_chars: 2000
 ```
 
+Names under `translation.providers` are operator-defined provider IDs, while
+`api_format` selects the request/response adapter. For example, the retained
+provider ID `translategamma` uses `api_format: translategemma_chat`. See
+`config/config.yaml.example` for the complete multi-provider routing example.
+
 #### TTS (Text-to-Speech)
 ```yaml
 tts:
@@ -271,6 +276,20 @@ Set `TRANSLATION_BASE_URL` to your self-hosted AI server when using OpenAI-compa
 
 Use `.env` for deployment-specific values such as API keys, service URLs, ports, and Docker model settings. Use `config/config.yaml` for application behavior such as mock mode, translation prompts, voice defaults, media storage, and latency thresholds.
 
+### Shared Voice Activity Detection
+
+PolyTalk can segment conversation, live microphone, and shared/tab audio once in
+the CE pipeline before routing to any STT provider. Each profile has four rollout
+modes: `off` preserves legacy behavior, `shadow` runs inference without changing
+the stream, `boundary` adds server pause boundaries without filtering audio, and
+`active` forwards only confirmed speech with pre-roll/post-roll protection.
+
+Keep all profiles `off` until the recorded regression corpus passes. Roll out one
+profile at a time through `shadow`, `boundary`, and `active`. The browser switches
+to continuous PCM only after CE confirms boundary/active VAD; STT then acknowledges
+`input_segmentation=upstream_vad` and bypasses its transport RMS gate. A VAD model
+load or inference failure fails open to legacy pass-through audio.
+
 ### Latency Tuning
 
 The main latency knobs are:
@@ -278,10 +297,13 @@ The main latency knobs are:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `LOG_LEVEL` | `INFO` | Application and STT service log level. Set `DEBUG` to include streaming diagnostics. |
+| `VAD_CONVERSATION_MODE` | `off` | Shared CE VAD rollout for conversation audio: `off`, `shadow`, `boundary`, or `active`. |
+| `VAD_LIVE_MICROPHONE_MODE` | `off` | Shared CE VAD rollout for live microphone audio. |
+| `VAD_SHARE_MODE` | `off` | Shared CE VAD rollout for shared/tab audio. |
 | `STT_STREAM_CHUNK_SECONDS` | `3.0` | Audio window processed by the STT service. Lower values reduce first transcript latency; higher values can improve transcript stability. |
 | `STT_EMIT_MIN_CHARS` | `120` | Minimum new transcript text before STT emits an update to PolyTalk. Increase this if live chunks are too small. |
 | `STT_EMIT_INTERVAL_SECONDS` | `4.5` | Maximum time to hold pending transcript text before emitting it. |
-| `STT_PAUSE_FLUSH_SECONDS` | `1.2` | Flush and emit the current speech window after this much trailing silence. Set `0` to disable pause flushing. |
+| `STT_PAUSE_FLUSH_SECONDS` | `2.0` | Flush and emit the current speech window after this much trailing silence. Set `0` to disable pause flushing. |
 | `STT_LEADING_SILENCE_PREROLL_SECONDS` | `0.2` | Keep this much audio before first detected speech while discarding longer tab-share startup silence. |
 | `STT_SILENCE_RMS_THRESHOLD` | `0.003` | Skip STT for very quiet audio windows. Raise this if Whisper hallucinates while nobody is speaking. |
 | `STT_NO_SPEECH_PROB_THRESHOLD` | `0.50` | Drop faster-whisper segments classified as likely no-speech. |
@@ -309,14 +331,43 @@ The main latency knobs are:
 | `VISUAL_CONTEXT_MODEL` | `TRANSLATION_MODEL` | Vision-capable model used to summarize the shared tab/page screenshot. |
 | `VISUAL_CONTEXT_MAX_TOKENS` | `240` | Maximum output tokens for the visual context summary. |
 | `app.translation_flush_chars` | `300` | Translate buffered text once this many characters are available. |
-| `app.translation_flush_seconds` | `5.0` | Translate buffered text after this many seconds if enough text is available. |
-| `app.translation_flush_min_chars` | `120` | Minimum text required for time-based translation flushing. |
+| `app.translation_flush_seconds` | `6.0` | In paced live/tab sessions, ask the semantic selector for a safe original-text prefix after this age. |
+| `app.translation_flush_min_chars` | `120` | Minimum text required for legacy non-session time-based translation flushing. |
+| `TRANSLATION_PAUSE_COMMIT_MODE` | `immediate` | `immediate` trusts an explicit acoustic pause and commits the whole buffer; `semantic` asks Qwen for a safe prefix. |
+| `TRANSLATION_SEMANTIC_HARD_SECONDS` | `10.0` | Local hard deadline that flushes the buffer without waiting longer for the selector. |
+| `SEMANTIC_BOUNDARY_ENABLED` | `true` | Enable Qwen boundary selection. Translation itself still follows the configured language routing. |
+| `SEMANTIC_BOUNDARY_PROVIDER` | empty | Optional named Qwen provider used only for boundary selection. Empty uses `translation.default_provider` or the flat translation endpoint. |
+| `SEMANTIC_BOUNDARY_MIN_CONFIDENCE` | `0.75` | Reject lower-confidence boundary IDs and keep buffering until a pause or hard deadline. |
+| `SEMANTIC_BOUNDARY_CHAT_TEMPLATE_KWARGS_ENABLED` | `true` | Send vLLM's `enable_thinking` chat-template option. Disable for OpenAI-compatible providers that reject this extension. |
+| `SEMANTIC_BOUNDARY_PROBE_COOLDOWN_SECONDS` | `3.0` | Minimum per-session delay between selector calls for changing buffer content. |
 | `translation.model` | `qwen3-8b` | Use a model supported by your provider or self-hosted server, such as qwen3-8b, TranslateGama, or another open-source/open-weight model. |
 | `translation.max_tokens` | `240` | Maximum translation output tokens. Keep bounded for live streaming, but allow enough room for Indic-script targets and longer sentence buffers. |
 | `translation.context_enabled` | `true` | Send recent successful source/target translation pairs as read-only context for later chunks. |
 | `translation.context_max_chunks` | `4` | Maximum previous translation chunks kept in per-session context. |
 | `translation.context_max_chars` | `1200` | Maximum source plus translated characters kept in per-session context. |
 | `translation.context_payload_warn_chars` | `2000` | Log a warning when final system plus user prompt text exceeds this many characters. Set `0` to disable. |
+
+Live and shared-tab clients may override `app.translation_flush_seconds` for a
+single WebSocket session with the bounded `translation_buffer_seconds` query
+parameter (1–10 seconds). They may also update it during the session by sending
+`{"type":"translation_buffer_config","translation_buffer_seconds":6}`. The
+session value holds translation/TTS across short STT emissions; cumulative
+transcription events remain immediate. Conversation mode remains pause-delimited.
+
+A client can send `{"type":"end_of_utterance","reason":"audio_gap"}` after a
+simple acoustic gap. PolyTalk forwards a non-terminal `flush` control to STT;
+the resulting `force_emit` transcript applies `TRANSLATION_PAUSE_COMMIT_MODE`.
+Without a pause, Qwen receives numbered candidate boundaries at the session
+interval and returns only a boundary ID, confidence, and reason. PolyTalk slices
+the original transcript locally, so the selector cannot rewrite or translate
+customer text. TranslateGemma/Qwen language routing is used only by the normal
+translation call. At `TRANSLATION_SEMANTIC_HARD_SECONDS`, PolyTalk locally
+flushes the remaining buffer even if the selector is slow or finds no boundary.
+
+PolyTalk also sends the session value to the selected STT provider in its initial
+WebSocket control message and forwards later updates. For specialized providers,
+`STT_STREAM_CHUNK_SECONDS` is therefore the startup fallback and optional
+partial-transcript cadence, not a fixed live-session latency floor.
 | `tts.timeout_seconds` | `10` | Maximum wait for TTS generation. |
 | `TTS_WORKERS` | `4` | Number of Piper Gunicorn workers. Keep `2-4` on small hosts; raise toward `min(8, CPU cores)` only after CPU and memory headroom are confirmed. |
 
@@ -326,14 +377,14 @@ For larger continuous-speech translation chunks, start with:
 STT_STREAM_CHUNK_SECONDS=3.0
 STT_EMIT_MIN_CHARS=120
 STT_EMIT_INTERVAL_SECONDS=4.5
-STT_PAUSE_FLUSH_SECONDS=1.2
+STT_PAUSE_FLUSH_SECONDS=2.0
 STT_LEADING_SILENCE_PREROLL_SECONDS=0.2
 ```
 
 ```yaml
 app:
   translation_flush_chars: 300
-  translation_flush_seconds: 5.0
+  translation_flush_seconds: 6.0
   translation_flush_min_chars: 120
 ```
 
@@ -522,6 +573,25 @@ instead of opening a public issue.
 > **Contribution Agreement**: By contributing to this project, you agree that:
 > 1. Your contributions will be licensed under AGPL-3.0
 > 2. You grant BizzAppDev Systems Pvt. Ltd. the right to use, modify, and relicense your contributions as part of commercial or proprietary versions of PolyTalk
+
+## Specialized speech providers
+
+Build and run IndicConformer, Parakeet TDT v3, SenseVoiceSmall, and Indic Parler
+TTS as part of the standard Compose stack.
+Accept the gated IndicConformer and Indic Parler model terms using the same
+Hugging Face account first, then set `HF_TOKEN` in the ignored `.env` file or
+export it in the build shell:
+
+    HF_TOKEN=hf_read_token_after_accepting_the_model_terms
+    docker compose --progress=plain build
+    docker compose up -d --no-build
+
+Indic Parler is the active provider for the configured Indian target languages.
+Punjabi support is unofficial and should be treated as experimental.
+
+Source repositories and model weights are fetched inside Docker builds; no
+developer-local model directory is used. See
+[the provider extension guide](docs/provider-extension.md) for routing details.
 
 ## Development
 

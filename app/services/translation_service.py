@@ -7,22 +7,36 @@ Translation service using configurable LLM translation API formats.
 Supports both real API and mock mode for testing.
 """
 
+import json
+import re
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
 
-from .base import BaseTranslationService, TranslationResult
 from ..config import get_config
 from ..utils.config import get_custom_instruction_max_chars, parse_bool_config
 from ..utils.logger import get_logger
 from ..utils.sanitize import normalize_instruction
+from .base import BaseTranslationService, TranslationResult
 
 logger = get_logger(__name__)
 
 
+@dataclass(frozen=True)
+class SemanticBoundaryDecision:
+    """A locally validated sentence boundary selected by the default LLM."""
+
+    boundary: int
+    confidence: float
+    reason: str = ""
+
+
 LANGUAGE_DISPLAY_NAMES = {
     "ar": "Arabic",
+    "as": "Assamese",
     "bn": "Bengali",
+    "brx": "Bodo",
     "de": "German",
     "en": "English",
     "es": "Spanish",
@@ -35,21 +49,26 @@ LANGUAGE_DISPLAY_NAMES = {
     "kn": "Kannada",
     "ko": "Korean",
     "ml": "Malayalam",
+    "mni": "Manipuri",
     "mr": "Marathi",
     "nl": "Dutch",
     "nl_BE": "Belgian Dutch",
     "pt": "Portuguese",
+    "or": "Odia",
+    "pa": "Punjabi",
     "ro": "Romanian",
     "ru": "Russian",
     "ta": "Tamil",
     "te": "Telugu",
     "tr": "Turkish",
+    "ur": "Urdu",
     "zh": "Chinese",
 }
 
 
 SUPPORTED_API_FORMATS = {
     "openai_chat",
+    "translategemma_chat",
     "openai_responses",
     "anthropic_messages",
     "gemini_generate_content",
@@ -60,6 +79,7 @@ PROVIDER_ROUTING_CONFIG_KEYS = frozenset(
         "providers",
         "default_provider",
         "routing",
+        "semantic_boundary_provider",
     }
 )
 
@@ -105,13 +125,44 @@ class TranslationService(BaseTranslationService):
         self.context_enabled = parse_bool_config(
             self.config.get("context_enabled"), True
         )
+        self.semantic_boundary_enabled = parse_bool_config(
+            self.config.get("semantic_boundary_enabled"), True
+        )
+        semantic_boundary_provider = _config_value(
+            self.config.get("semantic_boundary_provider"), ""
+        ).strip()
+        self.semantic_boundary_provider = semantic_boundary_provider or None
+        self.semantic_boundary_disable_thinking = parse_bool_config(
+            self.config.get("semantic_boundary_disable_thinking"), True
+        )
+        self.semantic_boundary_chat_template_kwargs_enabled = parse_bool_config(
+            self.config.get("semantic_boundary_chat_template_kwargs_enabled"), True
+        )
+        try:
+            self.semantic_boundary_timeout_seconds = float(
+                self.config.get("semantic_boundary_timeout_seconds", 5.0)
+            )
+        except (TypeError, ValueError):
+            self.semantic_boundary_timeout_seconds = 5.0
+        try:
+            self.semantic_boundary_min_confidence = float(
+                self.config.get("semantic_boundary_min_confidence", 0.75)
+            )
+        except (TypeError, ValueError):
+            self.semantic_boundary_min_confidence = 0.75
+        try:
+            self.semantic_boundary_max_tokens = int(
+                self.config.get("semantic_boundary_max_tokens", 100)
+            )
+        except (TypeError, ValueError):
+            self.semantic_boundary_max_tokens = 100
         try:
             self.max_tokens = int(self.config.get("max_tokens", 240))
         except (TypeError, ValueError):
             self.max_tokens = 240
         self.system_prompt_template = self.config.get(
             "system_prompt",
-            "You are a professional translator. Translate from {source_language} to {target_language}. Write natural, fluent {target_language}. Preserve the meaning only; do not add explanations, summaries, repeated text, or source-language commentary. If the source transcript is fragmented, translate the intended meaning as faithfully as possible. Return ONLY the translation.",
+            'You are a professional translator. Translate from {source_language} to {target_language}. Write natural, fluent {target_language}. Preserve the meaning only; do not add explanations, summaries, repeated text, or source-language commentary. If the source transcript is fragmented, translate the intended meaning as faithfully as possible.\n\nReturn the translation text. IMMEDIATELY after the translation, on a new line, append ###TRANSLATION_END###{{"translation_quality": 0.XX}} where X.X is a float between 0.0 and 1.0 representing your confidence in the translation quality. This JSON block is REQUIRED and must be included at the end of every response. Do NOT omit it.\n\nExample output:\n{{translation text here}}\n###TRANSLATION_END###{{"translation_quality": 0.95}}',
         )
 
         # Singleton httpx.AsyncClient with connection pooling
@@ -142,6 +193,107 @@ class TranslationService(BaseTranslationService):
             f"providers={len(self.providers)}, routing_rules={len(self.routing)}"
         )
 
+    async def select_semantic_boundary(
+        self, text: str, source_language: str
+    ) -> Optional[SemanticBoundaryDecision]:
+        """Select the longest safe prefix without allowing the model to rewrite it."""
+        normalized = " ".join((text or "").split())
+        words = list(re.finditer(r"\S+", normalized))
+        if not self.semantic_boundary_enabled or self.mock_mode or len(words) < 2:
+            return None
+
+        provider = (
+            self._get_provider_config(self.semantic_boundary_provider)
+            if self.semantic_boundary_provider
+            else self._configured_default_provider_config()
+        )
+        if self._provider_value(provider, "api_format", "openai_chat") != "openai_chat":
+            logger.warning(
+                "Semantic boundary selection requires an OpenAI chat provider"
+            )
+            return None
+
+        marked = " ".join(
+            f"{match.group(0)} [{index}]" for index, match in enumerate(words, 1)
+        )
+        system_prompt = (
+            "Choose the longest safe sentence boundary in the supplied transcript. "
+            "Return JSON only with boundary_id, confidence, and reason. A boundary is "
+            "safe only when the prefix is complete AND the suffix is empty or clearly "
+            "starts a new independent sentence/clause. Never split before a dependent "
+            "continuation such as to, that, because, an object, modifier, or auxiliary. "
+            "Punctuation may be missing. Return boundary_id 0 when no safe boundary "
+            "exists. Use only a supplied boundary ID. Do not translate or rewrite text."
+        )
+        enable_thinking = not self.semantic_boundary_disable_thinking
+        payload = {
+            "model": self._provider_value(provider, "model", self.model),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Source language: {source_language}\n"
+                        f"Transcript with candidate boundaries: {marked}"
+                    ),
+                },
+            ],
+            "temperature": 0.0,
+            "max_tokens": self.semantic_boundary_max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        if self.semantic_boundary_chat_template_kwargs_enabled:
+            payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+            provider_identity = (
+                self.semantic_boundary_provider or self.default_provider or "flat"
+            )
+            logger.debug(
+                "Semantic boundary chat template: provider=%s enable_thinking=%s",
+                provider_identity,
+                enable_thinking,
+            )
+        try:
+            response = await self._http_client.post(
+                self._build_url(provider),
+                headers=self._bearer_headers(provider),
+                json=payload,
+                timeout=self.semantic_boundary_timeout_seconds,
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            decision = json.loads(content)
+            boundary_id = int(decision.get("boundary_id", 0))
+            confidence = self._extract_float(decision.get("confidence"))
+        except (
+            httpx.HTTPError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            logger.warning(
+                "Semantic boundary selection failed: type=%s", type(exc).__name__
+            )
+            return None
+
+        if boundary_id == 0:
+            return None
+        if (
+            boundary_id < 1
+            or boundary_id > len(words)
+            or confidence is None
+            or confidence < self.semantic_boundary_min_confidence
+        ):
+            logger.warning("Rejected invalid or low-confidence semantic boundary")
+            return None
+        return SemanticBoundaryDecision(
+            # re.Match.end() and len(str) both use Unicode character offsets,
+            # including for Gujarati, Hindi, and other multi-byte UTF-8 scripts.
+            boundary=words[boundary_id - 1].end(),
+            confidence=confidence,
+            reason=str(decision.get("reason", ""))[:120],
+        )
+
     async def translate(
         self,
         text: str,
@@ -150,6 +302,7 @@ class TranslationService(BaseTranslationService):
         context: Optional[list[dict[str, str]]] = None,
         visual_context: Optional[str] = None,
         custom_instruction: Optional[str] = None,
+        custom_translation_routing: bool = False,
     ) -> TranslationResult:
         """
         Translate text from source to target language.
@@ -189,6 +342,7 @@ class TranslationService(BaseTranslationService):
                 context=context,
                 visual_context=visual_context,
                 custom_instruction=custom_instruction,
+                custom_translation_routing=custom_translation_routing,
             )
         except Exception as e:
             logger.error(f"Translation failed: {e}")
@@ -230,13 +384,21 @@ class TranslationService(BaseTranslationService):
         key = (source_language, target_language)
         translated_text = mock_translations.get(key, f"[{target_language}] {text}")
 
-        logger.info(f"Mock translation: {text[:30]}... -> {translated_text[:30]}...")
+        logger.info(
+            "Mock translation complete: %s -> %s "
+            "(source_chars=%d, translated_chars=%d)",
+            source_language,
+            target_language,
+            len(text),
+            len(translated_text),
+        )
 
         return TranslationResult(
             text=translated_text,
             source_language=source_language,
             target_language=target_language,
             success=True,
+            translation_quality=None,  # Mock mode has no confidence data
         )
 
     def _language_display_name(self, language: str) -> str:
@@ -380,9 +542,16 @@ class TranslationService(BaseTranslationService):
         )
 
     def _resolve_provider_config(
-        self, source_language: str, target_language: str
+        self,
+        source_language: str,
+        target_language: str,
+        *,
+        routing_enabled: bool = True,
     ) -> dict[str, Any]:
-        """Resolve translation provider by priority-based language routing."""
+        """Resolve the provider, optionally applying language routing rules."""
+        if not routing_enabled:
+            return self._configured_default_provider_config()
+
         matching_rules = []
         for index, rule in enumerate(self.routing):
             if not isinstance(rule, dict):
@@ -558,10 +727,13 @@ class TranslationService(BaseTranslationService):
         visual_context: Optional[str] = None,
         custom_instruction: Optional[str] = None,
         provider_config: dict[str, Any] | None = None,
+        custom_translation_routing: bool = True,
     ) -> tuple[str, dict[str, str], dict[str, Any]]:
         """Build provider-specific request details for a translation call."""
         provider_config = provider_config or self._resolve_provider_config(
-            source_language, target_language
+            source_language,
+            target_language,
+            routing_enabled=custom_translation_routing,
         )
         api_format = self._provider_value(provider_config, "api_format", "openai_chat")
         if api_format not in SUPPORTED_API_FORMATS:
@@ -573,6 +745,47 @@ class TranslationService(BaseTranslationService):
         sanitized_custom_instruction = self._sanitize_custom_instruction(
             custom_instruction
         )
+        if api_format == "translategemma_chat":
+            if sanitized_custom_instruction or visual_context:
+                logger.info(
+                    "TranslateGemma does not support custom instructions or visual "
+                    "context; using the default translation provider"
+                )
+                provider_config = self._configured_default_provider_config()
+                api_format = self._provider_value(
+                    provider_config, "api_format", "openai_chat"
+                )
+            else:
+                url = self._build_url(provider_config)
+                model = self._provider_value(
+                    provider_config, "model", "polytalk-translategemma"
+                )
+                temperature = self._provider_float(provider_config, "temperature", 0.0)
+                max_tokens = self._provider_int(provider_config, "max_tokens", 240)
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "source_lang_code": source_language.replace(
+                                        "_", "-"
+                                    ),
+                                    "target_lang_code": target_language.replace(
+                                        "_", "-"
+                                    ),
+                                    "text": text.strip(),
+                                }
+                            ],
+                        }
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                return url, self._bearer_headers(provider_config), payload
+
         system_prompt = self._build_contextual_system_prompt(
             source_language,
             target_language,
@@ -659,57 +872,188 @@ class TranslationService(BaseTranslationService):
         }
         return url, headers, payload
 
-    def _extract_text_from_content_blocks(self, blocks: list[Any]) -> str:
-        text_parts = []
-        for block in blocks:
-            if isinstance(block, dict):
-                block_text = block.get("text")
-                if block_text:
-                    text_parts.append(block_text)
-        return "".join(text_parts).strip()
-
     def _parse_translation_response(
         self, result: dict[str, Any], provider_config: dict[str, Any] | None = None
-    ) -> str:
-        """Extract translated text from a provider-specific response body."""
+    ) -> tuple[str, Optional[float]]:
+        """Extract translated text and translation_quality from a provider-specific response body.
+
+        Returns:
+            A tuple of (translated_text, translation_quality).
+        """
         provider_config = provider_config or self._legacy_provider_config()
         api_format = self._provider_value(provider_config, "api_format", "openai_chat")
 
-        try:
-            if api_format == "openai_chat":
-                return result["choices"][0]["message"]["content"].strip()
+        raw_content: str = ""
 
-            if api_format == "openai_responses":
+        try:
+            if api_format in {"openai_chat", "translategemma_chat"}:
+                raw_content = result["choices"][0]["message"]["content"].strip()
+
+            elif api_format == "openai_responses":
                 output_text = result.get("output_text")
                 if output_text:
-                    return output_text.strip()
-
-                text_parts = []
-                for output in result.get("output", []):
-                    for content in output.get("content", []):
-                        if content.get("type") in {"output_text", "text"}:
+                    raw_content = output_text.strip()
+                else:
+                    text_parts = []
+                    for output in result.get("output", []):
+                        for content in output.get("content", []):
+                            if content.get("type") not in {"output_text", "text"}:
+                                continue
                             content_text = content.get("text")
-                            if content_text:
-                                text_parts.append(content_text)
-                return "".join(text_parts).strip()
+                            if not content_text:
+                                continue
+                            text_parts.append(content_text)
 
-            if api_format == "anthropic_messages":
-                return self._extract_text_from_content_blocks(result.get("content", []))
+                    raw_content = "".join(text_parts).strip()
 
-            if api_format == "gemini_generate_content":
+            elif api_format == "anthropic_messages":
+                text_parts = []
+                for block in result.get("content", []):
+                    if not isinstance(block, dict):
+                        continue
+                    block_text = block.get("text")
+                    if not block_text:
+                        continue
+                    text_parts.append(block_text)
+
+                raw_content = "".join(text_parts).strip()
+
+            elif api_format == "gemini_generate_content":
                 text_parts = []
                 for candidate in result.get("candidates", []):
                     content = candidate.get("content", {})
-                    text_parts.append(
-                        self._extract_text_from_content_blocks(content.get("parts", []))
-                    )
-                return "".join(text_parts).strip()
-        except (KeyError, IndexError, TypeError, AttributeError) as exc:
-            raise ValueError(
-                f"Invalid {api_format} translation response: {result}"
-            ) from exc
+                    for part in content.get("parts", []):
+                        if isinstance(part, dict) and part.get("text"):
+                            text_parts.append(part["text"])
+                raw_content = "".join(text_parts).strip()
 
-        raise ValueError(f"Unsupported translation api_format '{api_format}'")
+            else:
+                raise ValueError(f"Unsupported translation api_format '{api_format}'")
+
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise ValueError(f"Invalid {api_format} translation response") from exc
+
+        if not raw_content:
+            raise ValueError(f"Empty {api_format} translation response")
+
+        # Split translation text from confidence indicators using ###TRANSLATION_END### separator
+        parts = raw_content.split("###TRANSLATION_END###", 1)
+        translated_text = parts[0].strip()
+
+        translation_quality: Optional[float] = None
+
+        if len(parts) > 1:
+            json_str = parts[1].strip()
+            if json_str.startswith("{"):
+                try:
+                    confidence_data = json.loads(json_str)
+                    if isinstance(confidence_data, dict):
+                        translation_quality = self._extract_float(
+                            confidence_data.get("translation_quality")
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to parse confidence JSON from translation response "
+                        "(chars=%d)",
+                        len(json_str),
+                    )
+            else:
+                logger.warning(
+                    "Confidence data after separator has an unexpected format "
+                    "(chars=%d)",
+                    len(json_str),
+                )
+        else:
+            # Fallback: separator not present. Try to find a standalone JSON block
+            # anywhere in the response that contains translation_quality.
+            lines = raw_content.split("\n")
+            candidate_lines: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("{") and stripped.endswith("}"):
+                    candidate_lines.append(stripped)
+
+            if candidate_lines:
+                for candidate_line in candidate_lines:
+                    if '"translation_quality"' in candidate_line:
+                        try:
+                            confidence_data = json.loads(candidate_line)
+                            if isinstance(confidence_data, dict):
+                                tq = self._extract_float(
+                                    confidence_data.get("translation_quality")
+                                )
+                                if tq is not None:
+                                    translation_quality = tq
+                                    # Strip the JSON line from translated text
+                                    json_line_idx = lines.index(candidate_line)
+                                    translated_text = "\n".join(
+                                        lines[:json_line_idx]
+                                        + lines[json_line_idx + 1 :]
+                                    ).strip()
+                                    break
+                        except (json.JSONDecodeError, TypeError):
+                            logger.debug(
+                                "Failed to parse fallback confidence JSON (chars=%d)",
+                                len(candidate_line),
+                            )
+                            continue
+
+        if not translated_text:
+            raise ValueError("Empty translation response")
+
+        if translation_quality is None and api_format != "translategemma_chat":
+            translation_quality = 0.5
+        return translated_text, translation_quality
+
+    def _translategemma_output_requires_fallback(
+        self, source_text: str, translated_text: str
+    ) -> bool:
+        """Return whether TranslateGemma expanded a direct translation suspiciously."""
+        source_lines = [
+            line.strip() for line in source_text.splitlines() if line.strip()
+        ]
+        translated_lines = [
+            line.strip() for line in translated_text.splitlines() if line.strip()
+        ]
+        # The line check catches lists or explanatory alternatives at any source
+        # length; the ratio check below catches verbose single-line output only
+        # for short sources, where expansion is especially suspicious.
+        if len(translated_lines) > max(2, len(source_lines) + 1):
+            return True
+
+        compact_source = " ".join(source_text.split())
+        compact_translation = " ".join(translated_text.split())
+        return len(compact_source) <= 120 and len(compact_translation) > max(
+            80, len(compact_source) * 6
+        )
+
+    async def _execute_translation_request(
+        self,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        provider_config: dict[str, Any],
+    ) -> tuple[str, Optional[float]]:
+        """Execute and parse one provider-specific translation request."""
+        response = await self._http_client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        try:
+            result = response.json()
+        except Exception as json_err:
+            raise Exception(
+                f"Failed to parse JSON response: {response.text}"
+            ) from json_err
+        return self._parse_translation_response(result, provider_config)
+
+    def _extract_float(self, value: Any) -> Optional[float]:
+        """Extract and clamp a float value to [0.0, 1.0]."""
+        if value is None:
+            return None
+        try:
+            f = float(value)
+            return max(0.0, min(1.0, f))
+        except (TypeError, ValueError):
+            return None
 
     async def _real_translate(
         self,
@@ -719,6 +1063,7 @@ class TranslationService(BaseTranslationService):
         context: Optional[list[dict[str, str]]] = None,
         visual_context: Optional[str] = None,
         custom_instruction: Optional[str] = None,
+        custom_translation_routing: bool = True,
     ) -> TranslationResult:
         """
         Translate text using the configured real translation API format.
@@ -737,7 +1082,9 @@ class TranslationService(BaseTranslationService):
             TranslationResult with translated text
         """
         provider_config = self._resolve_provider_config(
-            source_language, target_language
+            source_language,
+            target_language,
+            routing_enabled=custom_translation_routing,
         )
         url, headers, payload = self._build_translation_request(
             text,
@@ -747,25 +1094,65 @@ class TranslationService(BaseTranslationService):
             visual_context=visual_context,
             custom_instruction=custom_instruction,
             provider_config=provider_config,
+            custom_translation_routing=custom_translation_routing,
         )
 
-        response = await self._http_client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-
-        try:
-            result = response.json()
-        except Exception as json_err:
-            raise Exception(
-                f"Failed to parse JSON response: {response.text}"
-            ) from json_err
-
-        translated_text = self._parse_translation_response(result, provider_config)
+        translated_text, translation_quality = await self._execute_translation_request(
+            url, headers, payload, provider_config
+        )
         api_format = self._provider_value(provider_config, "api_format", "openai_chat")
+        if api_format == "translategemma_chat" and (
+            self._translategemma_output_requires_fallback(text, translated_text)
+        ):
+            fallback_provider = self._configured_default_provider_config()
+            fallback_api_format = self._provider_value(
+                fallback_provider, "api_format", "openai_chat"
+            )
+            if fallback_api_format != "translategemma_chat":
+                output_lines = sum(
+                    1 for line in translated_text.splitlines() if line.strip()
+                )
+                logger.warning(
+                    "TranslateGemma returned a suspiciously expanded response; "
+                    "retrying with the default translation provider "
+                    "(source_chars=%d, output_chars=%d, output_lines=%d)",
+                    len(text),
+                    len(translated_text),
+                    output_lines,
+                )
+                (
+                    fallback_url,
+                    fallback_headers,
+                    fallback_payload,
+                ) = self._build_translation_request(
+                    text,
+                    source_language,
+                    target_language,
+                    context=context,
+                    visual_context=visual_context,
+                    custom_instruction=custom_instruction,
+                    provider_config=fallback_provider,
+                    custom_translation_routing=False,
+                )
+                (
+                    translated_text,
+                    translation_quality,
+                ) = await self._execute_translation_request(
+                    fallback_url,
+                    fallback_headers,
+                    fallback_payload,
+                    fallback_provider,
+                )
         if not translated_text:
-            raise ValueError(f"Empty {api_format} translation response: {result}")
+            raise ValueError("Empty translation response")
 
         logger.info(
-            f"Real translation complete: {text[:30]}... -> {translated_text[:30]}..."
+            "Real translation complete: %s -> %s "
+            "(source_chars=%d, translated_chars=%d)",
+            source_language,
+            target_language,
+            len(text),
+            len(translated_text),
         )
 
         return TranslationResult(
@@ -773,6 +1160,7 @@ class TranslationService(BaseTranslationService):
             source_language=source_language,
             target_language=target_language,
             success=True,
+            translation_quality=translation_quality,
         )
 
     def _sanitize_custom_instruction(self, value: Optional[str]) -> str:

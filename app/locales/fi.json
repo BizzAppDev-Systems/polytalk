@@ -176,7 +176,11 @@
     "AI Behavior": "Tekoälyn toiminta",
     "Translation Instructions": "Käännösohjeet",
     "Translate formally. Keep technical terms in English.": "Käännä muodollisesti. Säilytä tekniset termit englanniksi.",
-    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "Valinnaiset ohjeet, jotka lähetetään live-, keskustelu- ja välilehden äänen käännösistuntoihin."
+    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "Valinnaiset ohjeet, jotka lähetetään live-, keskustelu- ja välilehden äänen käännösistuntoihin.",
+    "Advanced Translation Pacing": "Edistynyt käännösten ajoitus",
+    "Context window:": "Kontekstiikkuna:",
+    "seconds": "sekuntia",
+    "Larger values reduce fragmented translations for slow speech, but translation and spoken audio arrive later. The live transcript remains immediate. Applies to live microphone and shared-tab sessions.": "Suuremmat arvot vähentävät katkelmallisia käännöksiä hitaaseen puheluun, mutta käännös ja puhuttu ääni saapuvat myöhemmin. Live-transkripti on välitön. Sovelletaan live-mikrofoni- ja jaettuja välilehtisessioita."
   },
   "app.title": "PolyTalk - Yksityisyyttä painottava itse isännöity käännös",
   "js.error_message": "Virhe: {error}",

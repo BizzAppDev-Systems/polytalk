@@ -4,9 +4,23 @@ All notable changes to PolyTalk CE are documented in this file.
 
 PolyTalk CE uses app versions such as `0.4.0` and Git tags such as `v0.4.0-ce`.
 
-## Unreleased
+## 0.5.0 - 2026-08-25
 
-- No unreleased changes yet.
+- Added shared server-side VAD (Silero) with configurable conversation, live, and share profiles.
+- Added selected-text translation and speech API for manual UI-triggered translation.
+- Added routed STT providers (Conformer, Parakeet, SenseVoice) and Indic Parler TTS for regional languages.
+- Added Supertonic TTS provider support with Indic digit sanitization.
+- Added confidence indicator for translation quality in UI responses.
+- Added session-level translation pacing buffer for smoother translations.
+- Added faster-whisper upgrade to v1.2.1.
+- Improved streaming translation statement boundaries.
+- Hardened TTS input and audio generation for safety.
+- Added GPU service configuration for Docker Compose deployments.
+- Constrained STT language candidates based on conversation context.
+- Closed STT stream on pause and upstream WebSocket termination.
+- Redacted customer text from runtime logs.
+- Added translation service and pipeline tests.
+- Note: Added GPU Docker Compose deployment instructions with commented-out optional services (IndicConformer, Parakeet, SenseVoice STT, Indic Parler TTS) and setup instructions.
 
 ## 0.4.0 - 2026-07-06
 

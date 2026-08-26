@@ -5,11 +5,11 @@ Comprehensive tests for PolyTalk application.
 import asyncio
 import importlib.util
 import os
+import sys
 import time
+import types
 from pathlib import Path
 from unittest.mock import patch
-import sys
-import types
 
 import pytest
 
@@ -140,6 +140,7 @@ class TestConfig:
     def test_config_port(self):
         """Test port configuration."""
         import os
+
         from app.config import Config, get_config
 
         with patch.dict(os.environ, {"APP_PORT": "8000"}):
@@ -151,6 +152,7 @@ class TestConfig:
     def test_config_env_expansion(self):
         """Test environment variable expansion in config."""
         import os
+
         from app.config import Config
 
         with patch.dict(os.environ, {"TEST_VAR": "test_value"}):
@@ -162,6 +164,7 @@ class TestConfig:
     def test_config_type_conversion(self):
         """Test automatic type conversion in config."""
         import os
+
         from app.config import Config
 
         os.environ["APP_PORT"] = "8000"
@@ -270,6 +273,59 @@ class TestServices:
 
         assert len(results) > 0
         assert all(r.success for r in results)
+
+    @pytest.mark.asyncio
+    async def test_whisper_stream_closes_stt_when_audio_generator_ends_without_signal(
+        self,
+    ):
+        """Test upstream disconnect closes the downstream STT WebSocket."""
+        from app.services.whisper_service import WhisperService
+
+        class FakeWebSocket:
+            def __init__(self):
+                self.sent = []
+                self.close_calls = 0
+                self._closed_event = asyncio.Event()
+
+            async def send(self, message):
+                self.sent.append(message)
+
+            async def recv(self):
+                await self._closed_event.wait()
+                raise RuntimeError("closed")
+
+            async def close(self):
+                self.close_calls += 1
+                self._closed_event.set()
+
+        fake_ws = FakeWebSocket()
+
+        async def fake_connect(*args, **kwargs):
+            return fake_ws
+
+        async def audio_generator():
+            yield b"chunk1"
+
+        service = WhisperService()
+        service.enabled = True
+        service.mock_mode = False
+        service.max_reconnect_attempts = 1
+
+        async def consume_stream():
+            results = []
+            async for result in service.stream_transcribe(
+                audio_generator(),
+                language="en",
+            ):
+                results.append(result)
+            return results
+
+        with patch("app.services.whisper_service.websockets.connect", fake_connect):
+            results = await asyncio.wait_for(consume_stream(), timeout=2.0)
+
+        assert results == []
+        assert b"chunk1" in fake_ws.sent
+        assert fake_ws.close_calls >= 1
 
     def test_translation_service_init(self):
         """Test Translation service initialization."""
@@ -579,37 +635,170 @@ class TestServices:
         service = TranslationService()
 
         service.api_format = "openai_chat"
-        assert (
-            service._parse_translation_response(
-                {
-                    "choices": [{"message": {"content": "નમસ્તે"}}],
-                }
-            )
-            == "નમસ્તે"
+        text, quality = service._parse_translation_response(
+            {
+                "choices": [{"message": {"content": "નમસ્તે"}}],
+            }
         )
+        assert text == "નમસ્તે"
+        assert quality == 0.5
 
         service.api_format = "openai_responses"
-        assert service._parse_translation_response({"output_text": "નમસ્તે"}) == "નમસ્તે"
+        text, quality = service._parse_translation_response({"output_text": "નમસ્તે"})
+        assert text == "નમસ્તે"
+        assert quality == 0.5
 
         service.api_format = "anthropic_messages"
-        assert (
-            service._parse_translation_response(
-                {
-                    "content": [{"type": "text", "text": "નમસ્તે"}],
-                }
-            )
-            == "નમસ્તે"
+        text, quality = service._parse_translation_response(
+            {
+                "content": [{"type": "text", "text": "નમસ્તે"}],
+            }
         )
+        assert text == "નમસ્તે"
+        assert quality == 0.5
 
         service.api_format = "gemini_generate_content"
-        assert (
-            service._parse_translation_response(
-                {
-                    "candidates": [{"content": {"parts": [{"text": "નમસ્તે"}]}}],
-                }
-            )
-            == "નમસ્તે"
+        text, quality = service._parse_translation_response(
+            {
+                "candidates": [{"content": {"parts": [{"text": "નમસ્તે"}]}}],
+            }
         )
+        assert text == "નમસ્તે"
+        assert quality == 0.5
+
+    def test_translation_confidence_parsing_with_separator(self):
+        """Test confidence extraction when ###TRANSLATION_END### separator is present."""
+        from app.services.translation_service import TranslationService
+
+        service = TranslationService()
+        service.api_format = "openai_chat"
+
+        # Happy path: separator with valid JSON
+        text, quality = service._parse_translation_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": 'નમસ્તે###TRANSLATION_END###{"translation_quality": 0.85}'
+                        }
+                    }
+                ],
+            }
+        )
+        assert text == "નમસ્તે"
+        assert quality == 0.85
+
+        # Valid JSON with different quality value
+        text, quality = service._parse_translation_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": 'Hello world###TRANSLATION_END###{"translation_quality": 1.0}'
+                        }
+                    }
+                ],
+            }
+        )
+        assert text == "Hello world"
+        assert quality == 1.0
+
+        # Invalid JSON after separator: returns text with None quality
+        text, quality = service._parse_translation_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Hello world###TRANSLATION_END###not valid json"
+                        }
+                    }
+                ],
+            }
+        )
+        assert text == "Hello world"
+        assert quality == 0.5
+
+    def test_translation_confidence_fallback_json_on_own_line(self):
+        """Test fallback confidence extraction when separator is omitted but JSON is on its own line."""
+        from app.services.translation_service import TranslationService
+
+        service = TranslationService()
+        service.api_format = "openai_chat"
+
+        # JSON on its own last line (separator omitted)
+        text, quality = service._parse_translation_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": 'Hello world\n{"translation_quality": 0.75}'
+                        }
+                    }
+                ],
+            }
+        )
+        assert text == "Hello world"
+        assert quality == 0.75
+
+        # Multi-line translation with JSON fallback
+        text, quality = service._parse_translation_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": 'First sentence\nSecond sentence\n{"translation_quality": 0.9}'
+                        }
+                    }
+                ],
+            }
+        )
+        assert text == "First sentence\nSecond sentence"
+        assert quality == 0.9
+
+        # JSON embedded in text (not on its own line): should NOT strip
+        text, quality = service._parse_translation_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": 'See { "translation_quality": 0.5 } for details.'
+                        }
+                    }
+                ],
+            }
+        )
+        assert text == 'See { "translation_quality": 0.5 } for details.'
+        assert quality == 0.5
+
+        # JSON not on own line (mid-sentence): should NOT strip
+        text, quality = service._parse_translation_response(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": 'Note: {"translation_quality": 0.5} is important.'
+                        }
+                    }
+                ],
+            }
+        )
+        assert text == 'Note: {"translation_quality": 0.5} is important.'
+        assert quality == 0.5
+
+    def test_translation_confidence_no_data_returns_default(self):
+        """Test that missing confidence data returns 0.5 (50%%) as default."""
+        from app.services.translation_service import TranslationService
+
+        service = TranslationService()
+        service.api_format = "openai_chat"
+
+        text, quality = service._parse_translation_response(
+            {
+                "choices": [{"message": {"content": "Hello world"}}],
+            }
+        )
+        assert text == "Hello world"
+        assert quality == 0.5
 
     def test_translation_allows_openai_responses_without_api_key(self):
         """Test OpenAI-compatible responses can run without auth."""
@@ -640,17 +829,21 @@ class TestServices:
         assert "Authorization" not in headers
 
     def test_translation_parses_empty_gemini_edge_cases_as_empty_text(self):
-        """Test Gemini edge cases produce empty text for caller validation."""
+        """Test Gemini edge cases raise ValueError for empty responses."""
         from app.services.translation_service import TranslationService
 
         service = TranslationService()
         service.api_format = "gemini_generate_content"
 
-        assert service._parse_translation_response({"candidates": []}) == ""
-        assert service._parse_translation_response({"candidates": [{}]}) == ""
-        assert (
-            service._parse_translation_response({"candidates": [{"content": {}}]}) == ""
-        )
+        for payload in [
+            {"candidates": []},
+            {"candidates": [{}]},
+            {"candidates": [{"content": {}}]},
+        ]:
+            with pytest.raises(
+                ValueError, match="Empty gemini_generate_content translation response"
+            ):
+                service._parse_translation_response(payload)
 
     def test_translation_rejects_unknown_api_format(self):
         """Test unsupported API formats fail before making a request."""
@@ -834,7 +1027,9 @@ class TestServices:
             def __init__(self):
                 self.language_hints = []
 
-            async def stream_transcribe(self, audio_generator, language=None):
+            async def stream_transcribe(
+                self, audio_generator, language=None, **_kwargs
+            ):
                 self.language_hints.append(language)
                 yield TranscriptionResult(
                     text="hallo allemaal.",
@@ -916,7 +1111,9 @@ class TestServices:
         class FakeWhisperService:
             mock_mode = True
 
-            async def stream_transcribe(self, audio_generator, language=None):
+            async def stream_transcribe(
+                self, audio_generator, language=None, **_kwargs
+            ):
                 yield TranscriptionResult(
                     text="Working on",
                     language="en",
@@ -995,7 +1192,9 @@ class TestServices:
         class FakeWhisperService:
             mock_mode = True
 
-            async def stream_transcribe(self, audio_generator, language=None):
+            async def stream_transcribe(
+                self, audio_generator, language=None, **_kwargs
+            ):
                 yield TranscriptionResult(
                     text="The order arrived.",
                     language="en",
@@ -1094,13 +1293,16 @@ class TestServices:
     def test_pipeline_passes_visual_context_to_translation(self):
         """Test visual context summaries are passed to translation calls."""
         import asyncio
+
         from app.services.base import TranscriptionResult, TranslationResult, TTSResult
         from app.services.pipeline_service import TranslationPipelineService
 
         class FakeWhisperService:
             mock_mode = True
 
-            async def stream_transcribe(self, audio_generator, language=None):
+            async def stream_transcribe(
+                self, audio_generator, language=None, **_kwargs
+            ):
                 async for _ in audio_generator:
                     break
                 yield TranscriptionResult(
@@ -1222,8 +1424,9 @@ class TestServices:
     @pytest.mark.asyncio
     async def test_tts_synthesize_mock_mode(self):
         """Test TTS synthesis in mock mode."""
-        from app.services.tts_service import TTSService
         from pathlib import Path
+
+        from app.services.tts_service import TTSService
 
         service = TTSService()
         service.mock_mode = True
@@ -1238,8 +1441,9 @@ class TestServices:
     @pytest.mark.asyncio
     async def test_tts_synthesize_with_custom_path_mock(self):
         """Test TTS synthesis with custom output path in mock mode."""
-        from app.services.tts_service import TTSService
         from pathlib import Path
+
+        from app.services.tts_service import TTSService
 
         service = TTSService()
         service.mock_mode = True
@@ -1509,6 +1713,130 @@ class TestSTTCadence:
         assert result["metrics"]["force_emit"] is True
         assert captured_audio == [voice]
 
+    def test_stt_explicit_flush_emits_pending_audio_without_ending_stream(self):
+        """An enterprise acoustic-pause control force-emits the current window."""
+        from fastapi.testclient import TestClient
+
+        stt_main = load_stt_main_module(
+            {
+                "STT_SAMPLE_RATE": "10",
+                "STT_SAMPLE_WIDTH_BYTES": "2",
+                "STT_STREAM_CHUNK_SECONDS": "1.0",
+                "STT_EMIT_MIN_CHARS": "1",
+                "STT_TRANSCRIBE_WORKERS": "1",
+            }
+        )
+        voice = (10000).to_bytes(2, "little", signed=True) * 2
+        captured_force_emit = []
+
+        def fake_process_transcribe_job(model, job):
+            captured_force_emit.append(job.force_emit)
+            return stt_main.TranscribeResult(
+                sequence=job.sequence,
+                transcript="hello",
+                has_speech=True,
+                detected_language="en",
+                force_emit=job.force_emit,
+            )
+
+        stt_main._get_model = lambda: object()
+        stt_main._process_transcribe_job = fake_process_transcribe_job
+
+        with TestClient(stt_main.app) as client:
+            with client.websocket_connect("/v1/stream/transcriptions") as websocket:
+                websocket.send_bytes(voice)
+                websocket.send_text('{"type":"flush"}')
+                result = websocket.receive_json()
+                websocket.send_text('{"type":"end"}')
+
+        assert result["text"] == "hello"
+        assert result["metrics"]["force_emit"] is True
+        assert captured_force_emit == [True]
+
+    def test_stt_emit_interval_controls_live_inference_window(self):
+        """Session context pacing gives STT the same larger audio window."""
+        from fastapi.testclient import TestClient
+
+        stt_main = load_stt_main_module(
+            {
+                "STT_SAMPLE_RATE": "10",
+                "STT_SAMPLE_WIDTH_BYTES": "2",
+                "STT_STREAM_CHUNK_SECONDS": "0.2",
+                "STT_EMIT_MIN_CHARS": "1",
+                "STT_TRANSCRIBE_WORKERS": "1",
+            }
+        )
+        captured_audio = []
+        first_voice = (10000).to_bytes(2, "little", signed=True) * 2
+        remaining_voice = (10000).to_bytes(2, "little", signed=True) * 8
+
+        def fake_process_transcribe_job(model, job):
+            captured_audio.append(job.audio_bytes)
+            return stt_main.TranscribeResult(
+                sequence=job.sequence,
+                transcript="complete statement",
+                has_speech=True,
+                detected_language="en",
+                force_emit=job.force_emit,
+            )
+
+        stt_main._get_model = lambda: object()
+        stt_main._process_transcribe_job = fake_process_transcribe_job
+
+        with TestClient(stt_main.app) as client:
+            with client.websocket_connect("/v1/stream/transcriptions") as websocket:
+                websocket.send_text('{"emit_interval_seconds":1.0}')
+                assert websocket.receive_json() == {
+                    "type": "emit_interval_ack",
+                    "emit_interval_seconds": 1.0,
+                }
+                websocket.send_bytes(first_voice)
+                websocket.send_bytes(remaining_voice)
+                result = websocket.receive_json()
+
+        assert result["text"] == "complete statement"
+        assert captured_audio == [first_voice + remaining_voice]
+
+    def test_stt_explicit_flush_preempts_configured_inference_window(self):
+        """An acoustic pause still processes speech before the context interval."""
+        from fastapi.testclient import TestClient
+
+        stt_main = load_stt_main_module(
+            {
+                "STT_SAMPLE_RATE": "10",
+                "STT_SAMPLE_WIDTH_BYTES": "2",
+                "STT_STREAM_CHUNK_SECONDS": "0.2",
+                "STT_EMIT_MIN_CHARS": "1",
+                "STT_TRANSCRIBE_WORKERS": "1",
+            }
+        )
+        captured_audio = []
+        voice = (10000).to_bytes(2, "little", signed=True) * 2
+
+        def fake_process_transcribe_job(model, job):
+            captured_audio.append(job.audio_bytes)
+            return stt_main.TranscribeResult(
+                sequence=job.sequence,
+                transcript="paused statement",
+                has_speech=True,
+                detected_language="en",
+                force_emit=job.force_emit,
+            )
+
+        stt_main._get_model = lambda: object()
+        stt_main._process_transcribe_job = fake_process_transcribe_job
+
+        with TestClient(stt_main.app) as client:
+            with client.websocket_connect("/v1/stream/transcriptions") as websocket:
+                websocket.send_text('{"emit_interval_seconds":1.0}')
+                websocket.receive_json()
+                websocket.send_bytes(voice)
+                websocket.send_text('{"type":"flush"}')
+                result = websocket.receive_json()
+
+        assert result["metrics"]["force_emit"] is True
+        assert captured_audio == [voice]
+
     def test_stt_pause_emit_policy_ignores_regular_chunk_size_flush(self):
         """Test pause mode does not emit just because the stream window is full."""
         from fastapi.testclient import TestClient
@@ -1713,7 +2041,9 @@ class TestSTTCadence:
         """Test pause-flushed jobs remain emit-eligible after inference."""
         stt_main = load_stt_main_module()
 
-        def fake_transcribe_audio(model, wav_buffer, language, task):
+        def fake_transcribe_audio(
+            model, wav_buffer, language, task, candidate_languages=()
+        ):
             return "short phrase", True, "en"
 
         stt_main._transcribe_audio = fake_transcribe_audio
@@ -1732,6 +2062,170 @@ class TestSTTCadence:
 
         assert result.transcript == "short phrase"
         assert result.force_emit is True
+
+    def test_stt_candidate_language_selection_excludes_unrelated_language(self):
+        """Candidate languages constrain the explicit Whisper decode language."""
+        from types import SimpleNamespace
+
+        stt_main = load_stt_main_module({"STT_PRELOAD_MODEL": "false"})
+
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def transcribe(self, wav_buffer, **kwargs):
+                self.calls.append(kwargs["language"])
+                info = SimpleNamespace(
+                    language="ko",
+                    all_language_probs=[("ko", 0.6), ("en", 0.3), ("hi", 0.1)],
+                )
+                if kwargs["language"] is None:
+                    return iter(()), info
+                segment = SimpleNamespace(
+                    text="hello", no_speech_prob=0.0, avg_logprob=0.0
+                )
+                return iter((segment,)), SimpleNamespace(language=kwargs["language"])
+
+        model = FakeModel()
+        result = stt_main._transcribe_audio(
+            model,
+            stt_main._build_wav_buffer(b"\\x01\\x00" * 100),
+            None,
+            "transcribe",
+            ("en", "hi"),
+        )
+
+        assert result == ("hello", True, "en")
+        assert model.calls == [None, "en", "hi"]
+
+    def test_stt_candidate_language_selection_uses_script_for_ambiguous_audio(self):
+        """Ambiguous Gujarati audio is not forced into plausible English text."""
+        from types import SimpleNamespace
+
+        stt_main = load_stt_main_module({"STT_PRELOAD_MODEL": "false"})
+
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def transcribe(self, wav_buffer, **kwargs):
+                language = kwargs["language"]
+                self.calls.append(language)
+                if language is None:
+                    return iter(()), SimpleNamespace(
+                        language="hi",
+                        all_language_probs=[
+                            ("hi", 0.47),
+                            ("en", 0.30),
+                            ("gu", 0.23),
+                        ],
+                    )
+                text = (
+                    "What are you doing?" if language == "en" else "તમે શું કરી રહ્યા છો?"
+                )
+                segment = SimpleNamespace(
+                    text=text, no_speech_prob=0.0, avg_logprob=-0.2
+                )
+                return iter((segment,)), SimpleNamespace(language=language)
+
+        model = FakeModel()
+        result = stt_main._transcribe_audio(
+            model,
+            stt_main._build_wav_buffer(b"\\x01\\x00" * 100),
+            None,
+            "transcribe",
+            ("gu", "en"),
+        )
+
+        assert result == ("તમે શું કરી રહ્યા છો?", True, "gu")
+        assert model.calls == [None, "gu", "en"]
+
+    def test_stt_candidate_language_selection_caps_explicit_decodes(self):
+        """Ambiguous windows decode only the first configured candidates."""
+        from types import SimpleNamespace
+
+        stt_main = load_stt_main_module(
+            {
+                "STT_PRELOAD_MODEL": "false",
+                "STT_MAX_CANDIDATE_DECODES": "2",
+            }
+        )
+
+        class FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def transcribe(self, wav_buffer, **kwargs):
+                language = kwargs["language"]
+                self.calls.append(language)
+                if language is None:
+                    return iter(()), SimpleNamespace(
+                        language="ko",
+                        all_language_probs=[
+                            ("gu", 0.15),
+                            ("en", 0.55),
+                            ("hi", 0.25),
+                            ("fr", 0.05),
+                        ],
+                    )
+                segment = SimpleNamespace(
+                    text=f"text-{language}",
+                    no_speech_prob=0.0,
+                    avg_logprob=0.0,
+                )
+                return iter((segment,)), SimpleNamespace(language=language)
+
+        model = FakeModel()
+        result = stt_main._transcribe_audio(
+            model,
+            stt_main._build_wav_buffer(b"\x01\x00" * 100),
+            None,
+            "transcribe",
+            ("gu", "en", "hi", "fr"),
+        )
+
+        assert result[1] is True
+        assert result[2] == "en"
+        assert model.calls == [None, "gu", "en"]
+
+    def test_stt_candidate_tuning_defaults_are_bounded_and_documented(self):
+        """Candidate fallback defaults cap inference and retain script scoring."""
+        with patch.dict(os.environ, {}, clear=True):
+            stt_main = load_stt_main_module(
+                {
+                    "STT_PRELOAD_MODEL": "false",
+                    "TEST_VARIANT": "candidate_tuning_defaults",
+                }
+            )
+
+        assert stt_main.MAX_CANDIDATE_DECODES == 3
+        assert stt_main.CANDIDATE_SCRIPT_SCORE_WEIGHT == 1.50
+
+    def test_stt_candidate_language_selection_keeps_confident_fast_path(self):
+        """A confident selected-language detection avoids duplicate decoding."""
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        stt_main = load_stt_main_module({"STT_PRELOAD_MODEL": "false"})
+        segment = SimpleNamespace(text="hello", no_speech_prob=0.0, avg_logprob=-0.1)
+        model = SimpleNamespace()
+        model.transcribe = Mock(
+            return_value=(
+                iter((segment,)),
+                SimpleNamespace(language="en", all_language_probs=[("en", 0.91)]),
+            )
+        )
+
+        result = stt_main._transcribe_audio(
+            model,
+            stt_main._build_wav_buffer(b"\\x01\\x00" * 100),
+            None,
+            "transcribe",
+            ("gu", "en"),
+        )
+
+        assert result == ("hello", True, "en")
+        assert model.transcribe.call_count == 1
 
     def test_stt_silence_job_preserves_pause_force_emit(self):
         """Test pause-flushed silence jobs preserve force_emit."""

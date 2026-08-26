@@ -47,6 +47,7 @@ class TranslationResult:
         target_language: Target language code
         success: Whether translation succeeded
         error: Error message if failed (optional)
+        translation_quality: LLM-assessed confidence in the translation quality (0.0-1.0)
     """
 
     text: str
@@ -54,6 +55,7 @@ class TranslationResult:
     target_language: Optional[str] = None
     success: bool = True
     error: Optional[str] = None
+    translation_quality: Optional[float] = None
 
 
 @dataclass

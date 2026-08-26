@@ -176,7 +176,11 @@
     "AI Behavior": "Chování AI",
     "Translation Instructions": "Pokyny k překladu",
     "Translate formally. Keep technical terms in English.": "Překládejte formálně. Technické termíny ponechte v angličtině.",
-    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "Volitelné pokyny odesílané s relacemi živého překladu, konverzace a zvuku z karty."
+    "Optional guidance sent with live, conversation, and tab-audio translation sessions.": "Volitelné pokyny odesílané s relacemi živého překladu, konverzace a zvuku z karty.",
+    "Advanced Translation Pacing": "Pokročilé načasování překladu",
+    "Context window:": "Okno kontextu:",
+    "seconds": "sekund",
+    "Larger values reduce fragmented translations for slow speech, but translation and spoken audio arrive later. The live transcript remains immediate. Applies to live microphone and shared-tab sessions.": "Větší hodnoty snižují fragmentované překlady při pomalé řeči, ale překlad a mluvený zvuk přicházejí později. Živý přepis zůstává okamžitý. Platí pro živé mikrofonní a sdílené relace karet."
   },
   "app.title": "PolyTalk - Samostatně hostovaný překlad zaměřený na soukromí",
   "js.error_message": "Chyba: {error}",
