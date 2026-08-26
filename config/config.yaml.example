@@ -3,7 +3,7 @@
 
 whisper:
   enabled: true
-  mock_mode: true
+  mock_mode: false
   base_url: "${WHISPER_BASE_URL}"
   ws_endpoint: "${WHISPER_WS_ENDPOINT}"
   ping_interval_seconds: null
@@ -13,7 +13,7 @@ whisper:
 
 translation:
   enabled: true
-  mock_mode: true
+  mock_mode: false
   base_url: "${TRANSLATION_BASE_URL}"
   endpoint: "${TRANSLATION_ENDPOINT}"
   api_format: "${TRANSLATION_API_FORMAT}"
@@ -66,7 +66,7 @@ visual_context:
 
 tts:
   enabled: true
-  mock_mode: true
+  mock_mode: false
   provider: "piper"
   base_url: "${TTS_BASE_URL}"
   providers:
