@@ -103,6 +103,29 @@ class TTSService(BaseTTSService):
             logger.error(f"TTS synthesis failed: {e}")
             return TTSResult(success=False, error=str(e))
 
+    async def available_text_voices(self, language: str) -> list[dict[str, str]]:
+        """Expose installed Piper voices; other providers keep configured defaults."""
+        if self._get_provider_for_language(language) != "piper" or not self.enabled:
+            return []
+        _, base = self._normalize_language(language)
+        voices = await self._fetch_voices()
+        return [
+            {"id": key.removesuffix(".onnx"), "name": key.removesuffix(".onnx")}
+            for key in sorted(voices)
+            if key.split("_")[0].lower() == base
+        ]
+
+    async def synthesize_selected_voice(
+        self, text: str, language: str, voice: str
+    ) -> TTSResult:
+        """Use an explicitly chosen installed voice without mutating global config."""
+        available = await self.available_text_voices(language)
+        if not any(item["id"] == voice for item in available):
+            return TTSResult(
+                success=False, error="Voice is unavailable for this language"
+            )
+        return await self._piper_synthesize(text, language, voice_override=voice)
+
     async def _mock_synthesize(
         self, text: str, language: str, output_path: Optional[Path] = None
     ) -> TTSResult:

@@ -7,12 +7,14 @@ Tests for API router endpoints.
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.base import TranslationResult, TTSResult
 from app.services.pipeline_service import TranslationPipelineService
 from app.version import __version__
 
@@ -959,3 +961,217 @@ class TestWebSocketEndpoint:
                 pass
             except Exception:
                 pass
+
+
+class TestTextTranslationEndpoints:
+    """Tests for text translation and TTS endpoints following Enterprise pattern."""
+
+    def test_translate_text_succeeds(self, client):
+        """Test successful text translation."""
+        pipeline = MagicMock()
+        pipeline.translation.translate = AsyncMock(
+            return_value=TranslationResult(
+                text="નમસ્તે, તમે કેવા છો?",
+                source_language="en",
+                target_language="gu",
+            )
+        )
+
+        with patch("app.routers.api.get_pipeline_service", return_value=pipeline):
+            response = client.post(
+                "/api/text/translations",
+                json={
+                    "text": "Hello, how are you?",
+                    "source_language": "en",
+                    "target_language": "gu",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "translated_text": "નમસ્તે, તમે કેવા છો?",
+            "source_language": "en",
+            "target_language": "gu",
+        }
+        pipeline.translation.translate.assert_awaited_once_with(
+            "Hello, how are you?",
+            "en",
+            "gu",
+            custom_instruction="",
+            custom_translation_routing=False,
+            preserve_source_structure=True,
+        )
+
+    def test_translate_text_with_custom_routing(self, client):
+        """Test text translation with custom routing header."""
+        pipeline = MagicMock()
+        pipeline.translation.translate = AsyncMock(
+            return_value=TranslationResult(
+                text="नमस्तે",
+                source_language="en",
+                target_language="hi",
+            )
+        )
+
+        with patch("app.routers.api.get_pipeline_service", return_value=pipeline):
+            response = client.post(
+                "/api/text/translations",
+                json={
+                    "text": "Hello",
+                    "source_language": "en",
+                    "target_language": "hi",
+                },
+                headers={"X-PolyTalk-Translation-Routing": "custom"},
+            )
+
+        assert response.status_code == 200
+        pipeline.translation.translate.assert_awaited_once()
+        call_kwargs = pipeline.translation.translate.await_args
+        assert call_kwargs.kwargs["custom_translation_routing"] is True
+
+    def test_translate_text_rejects_whitespace_only_input(self, client):
+        """Whitespace-only input is rejected before calling a provider."""
+        pipeline = MagicMock()
+        with patch("app.routers.api.get_pipeline_service", return_value=pipeline):
+            response = client.post(
+                "/api/text/translations",
+                json={
+                    "text": "   \n ",
+                    "source_language": "en",
+                    "target_language": "hi",
+                },
+            )
+
+        assert response.status_code == 422
+        pipeline.translation.translate.assert_not_called()
+
+    def test_translate_text_rejects_excessive_custom_instruction(self, client):
+        """Custom instruction exceeding 1000 chars is rejected."""
+        response = client.post(
+            "/api/text/translations",
+            json={
+                "text": "Hello",
+                "source_language": "en",
+                "target_language": "hi",
+                "custom_instruction": "x" * 1001,
+            },
+        )
+        assert response.status_code == 422
+
+    def test_translate_text_hides_provider_failure_details(self, client):
+        """Provider failures use a stable client-facing error message."""
+        pipeline = MagicMock()
+        pipeline.translation.translate = AsyncMock(
+            return_value=TranslationResult(
+                text="",
+                success=False,
+                error="secret provider response",
+            )
+        )
+        with patch("app.routers.api.get_pipeline_service", return_value=pipeline):
+            response = client.post(
+                "/api/text/translations",
+                json={
+                    "text": "Hello",
+                    "source_language": "en",
+                    "target_language": "hi",
+                },
+            )
+
+        assert response.status_code == 502
+        assert "secret provider response" not in response.text
+
+    def test_text_voices_returns_provider_discovered_voices(self, client):
+        """The HTTP endpoint returns voices from the requested language."""
+        pipeline = MagicMock()
+        pipeline.tts.available_text_voices = AsyncMock(
+            return_value=[{"id": "de_DE-thorsten-medium", "name": "German Thorsten"}]
+        )
+
+        with patch("app.routers.api.get_pipeline_service", return_value=pipeline):
+            response = client.get("/api/text/voices", params={"language": "de"})
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "voices": [{"id": "de_DE-thorsten-medium", "name": "German Thorsten"}]
+        }
+        pipeline.tts.available_text_voices.assert_awaited_once_with("de")
+
+    @pytest.mark.parametrize("language", ["", "x" * 13])
+    def test_text_voices_rejects_invalid_language(self, client, language):
+        """Blank and oversized language values are rejected before TTS lookup."""
+        pipeline = MagicMock()
+        pipeline.tts.available_text_voices = AsyncMock()
+
+        with patch("app.routers.api.get_pipeline_service", return_value=pipeline):
+            response = client.get("/api/text/voices", params={"language": language})
+
+        assert response.status_code == 422
+        pipeline.tts.available_text_voices.assert_not_awaited()
+
+    def test_synthesize_text_rejects_whitespace_only_input(self, client):
+        """Whitespace-only text is rejected before TTS is called."""
+        pipeline = MagicMock()
+        with patch("app.routers.api.get_pipeline_service", return_value=pipeline):
+            response = client.post(
+                "/api/text/speech",
+                json={"text": "   \n ", "language": "en"},
+            )
+
+        assert response.status_code == 422
+        pipeline.tts.synthesize.assert_not_called()
+
+    def test_synthesize_text_returns_audio_and_removes_temporary_file(
+        self, client, tmp_path
+    ):
+        """Typed-text TTS returns bytes without leaving its temporary artifact."""
+        audio_path = tmp_path / "typed-text.wav"
+        audio_path.write_bytes(b"RIFF-test-audio")
+        pipeline = MagicMock()
+        pipeline.tts.synthesize = AsyncMock(
+            return_value=TTSResult(
+                audio_path=Path(audio_path), duration=1.25, success=True
+            )
+        )
+
+        with patch("app.routers.api.get_pipeline_service", return_value=pipeline):
+            response = client.post(
+                "/api/text/speech",
+                json={"text": "નમસ્તે", "language": "hi"},
+            )
+
+        assert response.status_code == 200
+        assert response.content == b"RIFF-test-audio"
+        assert response.headers["content-type"].startswith("audio/wav")
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-audio-duration-seconds"] == "1.25"
+        assert not audio_path.exists()
+
+    def test_audio_media_type_uses_generated_file_extension(self):
+        """Generated speech is never mislabeled as WAV for other formats."""
+        from app.routers.api import _audio_media_type
+
+        assert _audio_media_type(Path("speech.wav")) == "audio/wav"
+        assert _audio_media_type(Path("speech.mp3")) == "audio/mpeg"
+        assert _audio_media_type(Path("speech.ogg")) == "audio/ogg"
+        assert _audio_media_type(Path("speech.opus")) == "audio/ogg"
+        assert _audio_media_type(Path("speech.flac")) == "audio/flac"
+        assert _audio_media_type(Path("speech.webm")) == "audio/webm"
+        assert _audio_media_type(Path("speech.aac")) == "audio/aac"
+        assert _audio_media_type(Path("speech.m4a")) == "audio/mp4"
+        assert _audio_media_type(Path("speech.unknown")) == "application/octet-stream"
+
+    def test_synthesize_text_failure_does_not_expose_provider_error(self, client):
+        """TTS provider details stay out of HTTP responses."""
+        pipeline = MagicMock()
+        pipeline.tts.synthesize = AsyncMock(
+            return_value=TTSResult(success=False, error="provider secret")
+        )
+        with patch("app.routers.api.get_pipeline_service", return_value=pipeline):
+            response = client.post(
+                "/api/text/speech",
+                json={"text": "નમસ્તે", "language": "hi"},
+            )
+
+        assert response.status_code == 502
+        assert "provider secret" not in response.text
