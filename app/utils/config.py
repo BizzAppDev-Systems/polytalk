@@ -91,3 +91,40 @@ def parse_int_config(
                 default,
             )
         return default
+
+
+def parse_float_config(
+    value: object,
+    default: float,
+    *,
+    name: str | None = None,
+    warn_on_invalid: bool = False,
+) -> float:
+    """Parse float config values with a safe default."""
+    if isinstance(value, bool):
+        if warn_on_invalid:
+            logger.warning(
+                "Invalid float config%s=%r; using default %s",
+                f" {name}" if name else "",
+                value,
+                default,
+            )
+        return default
+
+    normalized = str(value or "").strip()
+    if not normalized:
+        return default
+
+    try:
+        return float(normalized)
+    except (TypeError, ValueError):
+        if warn_on_invalid and not (
+            normalized.startswith("${") and normalized.endswith("}")
+        ):
+            logger.warning(
+                "Invalid float config%s=%r; using default %s",
+                f" {name}" if name else "",
+                value,
+                default,
+            )
+        return default

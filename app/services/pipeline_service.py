@@ -21,6 +21,7 @@ from .base import TranslationResult, TTSResult
 from .whisper_service import WhisperService
 from .translation_service import TranslationService
 from .tts_service import TTSService
+from .audio_vad import AudioVadService
 from ..config import get_config
 from ..utils.config import get_custom_instruction_max_chars, parse_bool_config
 from ..utils.logger import get_logger
@@ -110,6 +111,7 @@ class TranslationPipelineService:
         self.translation = translation_service or TranslationService()
         self.tts = tts_service or TTSService()
         self.media_dir = get_config().media_output_dir
+        self.vad = AudioVadService()
 
         logger.info("TranslationPipelineService initialized")
 
@@ -341,6 +343,13 @@ class TranslationPipelineService:
                     await asyncio.sleep(0.1)
                 yield chunk
 
+        vad_input_type = "share" if visual_context_queue is not None else "microphone"
+        vad_audio_generator = self.vad.process_stream(
+            paused_audio_generator(),
+            mode="conversation",
+            input_type=vad_input_type,
+        )
+
         async def drain_visual_context_updates() -> None:
             nonlocal visual_context_summary
             if visual_context_queue is None:
@@ -375,7 +384,7 @@ class TranslationPipelineService:
 
         try:
             async for trans_result in self.whisper.stream_transcribe(
-                paused_audio_generator(),
+                vad_audio_generator,
                 None,
                 emit_policy="pause",
                 candidate_languages=[source_language, target_language],
@@ -594,6 +603,13 @@ class TranslationPipelineService:
                     await asyncio.sleep(0.1)
                 yield chunk
 
+        vad_input_type = "share" if visual_context_queue is not None else "microphone"
+        vad_audio_generator = self.vad.process_stream(
+            paused_audio_generator(),
+            mode=mode,
+            input_type=vad_input_type,
+        )
+
         async def tts_worker():
             """TTS worker task - generates speech from translated sentences."""
             tts_seq = 0
@@ -695,7 +711,7 @@ class TranslationPipelineService:
             try:
                 logger.info("ASR worker: starting stream_transcribe")
                 async for trans_result in self.whisper.stream_transcribe(
-                    paused_audio_generator(), detected_language
+                    vad_audio_generator, detected_language
                 ):
                     logger.debug(
                         f"ASR worker: got transcription result, success={trans_result.success}"

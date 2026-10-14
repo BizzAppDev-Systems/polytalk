@@ -98,6 +98,7 @@ async def websocket_translate(
     target_language: str = "gu",
     mode: str = "live",
     custom_instruction: str | None = None,
+    input_type: str = "microphone",
 ):
     """
     WebSocket endpoint for real-time audio translation streaming (2-thread pipeline).
@@ -108,6 +109,7 @@ async def websocket_translate(
         target_language: Target language code
         mode: Translation mode, either live or conversation.
         custom_instruction: Optional user-provided translation guidance.
+        input_type: Audio input type, either microphone or share.
     """
     await websocket.accept()
     logger.info(
@@ -117,6 +119,13 @@ async def websocket_translate(
     if mode not in {"live", "conversation"}:
         await websocket.send_json(
             {"type": "error", "error": "mode must be live or conversation"}
+        )
+        await websocket.close()
+        return
+
+    if input_type not in {"microphone", "share"}:
+        await websocket.send_json(
+            {"type": "error", "error": "input_type must be microphone or share"}
         )
         await websocket.close()
         return
@@ -333,6 +342,18 @@ async def websocket_translate(
                 "Pipeline ready with warnings",
             )
 
+        vad_mode = pipeline.vad.effective_mode(mode, input_type)
+        if vad_mode.value != "off":
+            await send_result(
+                {
+                    "type": "audio_segmentation",
+                    "mode": vad_mode.value,
+                    "input_type": input_type,
+                    "continuous_audio": True,
+                }
+            )
+            logger.info(f"VAD enabled: mode={vad_mode.value} input_type={input_type}")
+
         async for result in pipeline.process_streaming(
             audio_gen,
             source_language,
@@ -341,6 +362,7 @@ async def websocket_translate(
             pause_event=pause_event,
             language_swap_queue=language_swap_queue,
             visual_context_queue=visual_context_queue,
+            input_type=input_type,
             custom_instruction=sanitize_custom_instruction(custom_instruction),
             custom_instruction_queue=custom_instruction_queue,
         ):
