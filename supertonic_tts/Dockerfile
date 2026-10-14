@@ -20,6 +20,7 @@ RUN addgroup --system supertonic \
     && chown -R supertonic:supertonic /data /app
 
 COPY entrypoint.sh /app/entrypoint.sh
+COPY text_filter.py sitecustomize.py /usr/local/lib/python3.12/site-packages/
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 7788

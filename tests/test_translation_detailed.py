@@ -5,13 +5,323 @@
 Tests for translation service methods.
 """
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-import json
 import pytest
 
 from app.services.translation_service import TranslationService
+
+
+def _translation_response(content: str, finish_reason: str = "stop") -> MagicMock:
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "choices": [
+            {
+                "message": {"content": content},
+                "finish_reason": finish_reason,
+            }
+        ]
+    }
+    return response
+
+
+class TestTypedTextOutputLimits:
+    """Typed HTTP translations get isolated truncation recovery."""
+
+    @pytest.mark.parametrize(
+        ("api_format", "result"),
+        [
+            ("openai_chat", {"choices": [{"finish_reason": "length"}]}),
+            (
+                "openai_responses",
+                {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                },
+            ),
+            ("anthropic_messages", {"stop_reason": "max_tokens"}),
+            (
+                "gemini_generate_content",
+                {"candidates": [{"finishReason": "MAX_TOKENS"}]},
+            ),
+        ],
+    )
+    def test_detects_provider_output_limits(self, api_format, result):
+        assert TranslationService._translation_response_was_truncated(
+            result, api_format
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "expected_joiner"),
+        [
+            ("first\nsecond", "\n"),
+            ("aaaa\n\nbbbbbb", "\n\n"),
+            ("First sentence. Second sentence.", " "),
+        ],
+    )
+    def test_truncated_split_preserves_selected_boundary(self, source, expected_joiner):
+        left, right, joiner = TranslationService._split_truncated_typed_text(source)
+
+        assert left
+        assert right
+        assert joiner == expected_joiner
+
+    @pytest.mark.asyncio
+    async def test_typed_translation_retries_truncated_text_in_smaller_parts(self):
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = {
+                "enabled": True,
+                "mock_mode": False,
+                "base_url": "http://translation:8001",
+                "endpoint": "/v1/chat/completions",
+                "api_format": "openai_chat",
+                "model": "translation-model",
+                "max_tokens": 240,
+                "typed_text_max_tokens": 1536,
+            }
+            service = TranslationService()
+
+        responses = [
+            _translation_response("अधूरा", "length"),
+            _translation_response("पहला भाग"),
+            _translation_response("दूसरा भाग"),
+        ]
+        source = (
+            "The first half contains enough text for a provider request. "
+            "The second half must also be translated without being omitted."
+        )
+        with patch.object(
+            service._http_client,
+            "post",
+            new=AsyncMock(side_effect=responses),
+        ) as post:
+            result = await service._real_translate(
+                source,
+                "en",
+                "hi",
+                preserve_source_structure=True,
+            )
+
+        assert result.success is True
+        assert result.text == "पहला भाग दूसरा भाग"
+        assert post.await_count == 3
+        assert all(
+            call.kwargs["json"]["max_tokens"] == 1536 for call in post.await_args_list
+        )
+        await service.close()
+
+    @pytest.mark.asyncio
+    async def test_live_translation_keeps_existing_limit_and_no_typed_retry(self):
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = {
+                "enabled": True,
+                "mock_mode": False,
+                "base_url": "http://translation:8001",
+                "endpoint": "/v1/chat/completions",
+                "api_format": "openai_chat",
+                "model": "translation-model",
+                "max_tokens": 240,
+                "typed_text_max_tokens": 1536,
+            }
+            service = TranslationService()
+
+        with patch.object(
+            service._http_client,
+            "post",
+            new=AsyncMock(return_value=_translation_response("लाइव अंश", "length")),
+        ) as post:
+            result = await service._real_translate("Live fragment", "en", "hi")
+
+        assert result.text == "लाइव अंश"
+        assert post.await_count == 1
+        assert post.await_args.kwargs["json"]["max_tokens"] == 240
+        await service.close()
+
+
+class TestSemanticBoundarySelection:
+    """Test the Qwen-only sentence-boundary selector contract."""
+
+    @pytest.mark.asyncio
+    async def test_selects_original_text_prefix_for_full_sentence_and_fragment(self):
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = {
+                "enabled": True,
+                "mock_mode": False,
+                "base_url": "http://fallback:8001",
+                "endpoint": "/v1/chat/completions",
+                "api_format": "openai_chat",
+                "model": "fallback-model",
+                "semantic_boundary_enabled": True,
+                "semantic_boundary_provider": "qwen3",
+                "providers": {
+                    "qwen3": {
+                        "base_url": "http://qwen:8001",
+                        "endpoint": "/v1/chat/completions",
+                        "api_format": "openai_chat",
+                        "model": "polytalk-vllm",
+                    }
+                },
+            }
+            service = TranslationService()
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "boundary_id": 4,
+                                "confidence": 0.96,
+                                "reason": "new clause follows",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        with (
+            patch.object(
+                service._http_client, "post", new=AsyncMock(return_value=response)
+            ) as post,
+            patch("app.services.translation_service.logger.debug") as debug_log,
+        ):
+            decision = await service.select_semantic_boundary(
+                "Meeting is on Friday Do not forget to", "en"
+            )
+
+        assert decision is not None
+        assert decision.boundary == len("Meeting is on Friday")
+        assert post.await_args.args[0] == "http://qwen:8001/v1/chat/completions"
+        payload = post.await_args.kwargs["json"]
+        assert payload["model"] == "polytalk-vllm"
+        assert payload["response_format"] == {"type": "json_object"}
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        assert "Friday [4] Do [5]" in payload["messages"][1]["content"]
+        debug_log.assert_called_once_with(
+            "Semantic boundary chat template: provider=%s enable_thinking=%s",
+            "qwen3",
+            False,
+        )
+        await service.close()
+
+    @pytest.mark.asyncio
+    async def test_uses_unicode_character_offset_for_gujarati_prefix(self):
+        """Gujarati boundaries use Python character offsets, not UTF-8 byte offsets."""
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = {
+                "enabled": True,
+                "mock_mode": False,
+                "api_format": "openai_chat",
+                "semantic_boundary_enabled": True,
+            }
+            service = TranslationService()
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps({"boundary_id": 3, "confidence": 0.96})
+                    }
+                }
+            ]
+        }
+        with patch.object(
+            service._http_client, "post", new=AsyncMock(return_value=response)
+        ):
+            decision = await service.select_semantic_boundary(
+                "\u0aac\u0ac7\u0aa0\u0a95 \u0ab6\u0ac1\u0a95\u0acd\u0ab0\u0ab5\u0abe\u0ab0\u0ac7 \u0a9b\u0ac7 \u0aad\u0ac2\u0ab2\u0ab6\u0acb \u0aa8\u0ab9\u0ac0\u0a82",
+                "gu",
+            )
+
+        expected_prefix = "\u0aac\u0ac7\u0aa0\u0a95 \u0ab6\u0ac1\u0a95\u0acd\u0ab0\u0ab5\u0abe\u0ab0\u0ac7 \u0a9b\u0ac7"
+        assert decision is not None
+        assert decision.boundary == len(expected_prefix)
+        assert len(expected_prefix.encode("utf-8")) > decision.boundary
+        await service.close()
+
+    @pytest.mark.asyncio
+    async def test_semantic_boundary_is_enabled_when_config_is_omitted(self):
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = {
+                "enabled": True,
+                "mock_mode": False,
+            }
+            service = TranslationService()
+
+        assert service.semantic_boundary_enabled is True
+        await service.close()
+
+    @pytest.mark.asyncio
+    async def test_no_boundary_returns_none_and_can_omit_chat_template_kwargs(self):
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = {
+                "enabled": True,
+                "mock_mode": False,
+                "api_format": "openai_chat",
+                "semantic_boundary_enabled": True,
+                "semantic_boundary_chat_template_kwargs_enabled": False,
+            }
+            service = TranslationService()
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps({"boundary_id": 0, "confidence": 0.99})
+                    }
+                }
+            ]
+        }
+        with patch.object(
+            service._http_client, "post", new=AsyncMock(return_value=response)
+        ) as post:
+            decision = await service.select_semantic_boundary("Do not forget to", "en")
+
+        assert decision is None
+        assert "chat_template_kwargs" not in post.await_args.kwargs["json"]
+        await service.close()
+
+    @pytest.mark.asyncio
+    async def test_rejects_low_confidence_boundary(self):
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = {
+                "enabled": True,
+                "mock_mode": False,
+                "api_format": "openai_chat",
+                "semantic_boundary_enabled": True,
+                "semantic_boundary_min_confidence": 0.75,
+            }
+            service = TranslationService()
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps({"boundary_id": 4, "confidence": 0.40})
+                    }
+                }
+            ]
+        }
+        with patch.object(
+            service._http_client, "post", new=AsyncMock(return_value=response)
+        ):
+            decision = await service.select_semantic_boundary(
+                "Meeting is on Friday Do not forget to", "en"
+            )
+
+        assert decision is None
+        await service.close()
 
 
 class TestTranslationServiceClose:
@@ -547,7 +857,7 @@ class TestTranslationProviderRouting:
                 "translategamma": {
                     "base_url": "https://gamma.example.com",
                     "endpoint": "/v1/chat/completions",
-                    "api_format": "openai_chat",
+                    "api_format": "translategemma_chat",
                     "api_key": "gamma-key",
                     "model": "translategamma",
                 },
@@ -566,6 +876,26 @@ class TestTranslationProviderRouting:
             ],
         }
 
+    def test_routing_disabled_uses_configured_default_provider(self):
+        """Legacy mode ignores language routing rules and uses the default provider."""
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = self._service_config()
+            service = TranslationService()
+
+        provider = service._resolve_provider_config("en", "gu", routing_enabled=False)
+
+        assert provider["model"] == "qwen3"
+
+    def test_routing_enabled_selects_matching_provider(self):
+        """Custom mode applies the configured language routing rules."""
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = self._service_config()
+            service = TranslationService()
+
+        provider = service._resolve_provider_config("en", "gu", routing_enabled=True)
+
+        assert provider["model"] == "translategamma"
+
     def test_routing_priority_selects_highest_priority_matching_provider(self):
         """Test priority resolves source and target language rule conflicts."""
         with patch("app.services.translation_service.get_config") as mock_config:
@@ -577,6 +907,213 @@ class TestTranslationProviderRouting:
         assert url == "https://gamma.example.com/v1/chat/completions"
         assert headers["Authorization"] == "Bearer gamma-key"
         assert payload["model"] == "translategamma"
+
+    def test_translategemma_uses_structured_user_only_message(self):
+        """TranslateGemma receives its strict language-code chat payload."""
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = self._service_config()
+            service = TranslationService()
+
+        _, _, payload = service._build_translation_request(" Hello ", "en_US", "gu_IN")
+
+        assert payload["messages"] == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "source_lang_code": "en-US",
+                        "target_lang_code": "gu-IN",
+                        "text": "Hello",
+                    }
+                ],
+            }
+        ]
+
+    def test_translategemma_custom_instruction_uses_qwen(self):
+        """Unsupported instruction prompting stays on the default provider."""
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = self._service_config()
+            service = TranslationService()
+
+        url, _, payload = service._build_translation_request(
+            "Hello", "en", "gu", custom_instruction="Use a formal tone"
+        )
+
+        assert url == "https://qwen.example.com/v1/chat/completions"
+        assert payload["model"] == "qwen3"
+        assert payload["messages"][0]["role"] == "system"
+
+    def test_translategemma_missing_confidence_remains_unavailable(self):
+        """TranslateGemma does not fabricate a 50% quality score."""
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = self._service_config()
+            service = TranslationService()
+
+        text, quality = service._parse_translation_response(
+            {"choices": [{"message": {"content": "નમસ્તે"}}]},
+            self._service_config()["providers"]["translategamma"],
+        )
+
+        assert text == "નમસ્તે"
+        assert quality is None
+
+    def test_translategemma_explanatory_output_requires_fallback(self):
+        """Multiple alternatives are rejected as a non-direct translation."""
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = self._service_config()
+            service = TranslationService()
+
+        assert service._translategemma_output_requires_fallback(
+            "Come on.",
+            "চলুন।\nঅথবা,\nআয়।\n(প্রসঙ্গ অনুযায়ী উপযুক্ত অনুবাদ ব্যবহার করা উচিত।)",
+        )
+        assert not service._translategemma_output_requires_fallback(
+            "Come on.", "চলুন।\nএগিয়ে যান।"
+        )
+        assert not service._translategemma_output_requires_fallback("Come on.", "চলুন।")
+
+    @pytest.mark.asyncio
+    async def test_translategemma_explanatory_output_retries_with_qwen(self):
+        """A verbose TranslateGemma response is replaced by the local default."""
+        config = self._service_config()
+        config["routing"][0]["target_langs"].append("bn")
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = config
+            service = TranslationService()
+
+        gamma_response = MagicMock()
+        gamma_response.raise_for_status.return_value = None
+        gamma_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            "চলুন।\nঅথবা,\nআয়।\n(প্রসঙ্গ অনুযায়ী উপযুক্ত অনুবাদ ব্যবহার করা উচিত।)"
+                        )
+                    }
+                }
+            ]
+        }
+        qwen_response = MagicMock()
+        qwen_response.raise_for_status.return_value = None
+        qwen_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            'চলুন।\n###TRANSLATION_END###{"translation_quality": 0.93}'
+                        )
+                    }
+                }
+            ]
+        }
+
+        with patch.object(
+            service._http_client,
+            "post",
+            new=AsyncMock(side_effect=[gamma_response, qwen_response]),
+        ) as mock_post:
+            result = await service._real_translate(
+                "Come on.",
+                "en",
+                "bn",
+                custom_translation_routing=True,
+            )
+
+        assert result.text == "চলুন।"
+        assert result.translation_quality == 0.93
+        assert mock_post.await_count == 2
+        assert (
+            mock_post.await_args_list[0]
+            .args[0]
+            .startswith("https://gamma.example.com/")
+        )
+        assert (
+            mock_post.await_args_list[1].args[0].startswith("https://qwen.example.com/")
+        )
+
+    @pytest.mark.asyncio
+    async def test_truncated_translategemma_fallback_retries_smaller_parts(self):
+        """Typed fallback truncation uses the bounded split-and-retry path."""
+        config = self._service_config()
+        config["routing"][0]["target_langs"].append("bn")
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = config
+            service = TranslationService()
+
+        source = (
+            "The first half contains enough text for a provider request. "
+            "The second half must also be translated without being omitted."
+        )
+        responses = [
+            _translation_response(
+                "চলুন।\nঅথবা,\nআয়।\n(প্রসঙ্গ অনুযায়ী উপযুক্ত অনুবাদ ব্যবহার করা উচিত।)"
+            ),
+            _translation_response("অসম্পূর্ণ", "length"),
+            _translation_response("প্রথম অংশ"),
+            _translation_response("দ্বিতীয় অংশ"),
+        ]
+        with patch.object(
+            service._http_client,
+            "post",
+            new=AsyncMock(side_effect=responses),
+        ) as post:
+            result = await service._real_translate(
+                source,
+                "en",
+                "bn",
+                custom_translation_routing=True,
+                preserve_source_structure=True,
+            )
+
+        assert result.text == "প্রথম অংশ দ্বিতীয় অংশ"
+        assert post.await_count == 4
+        assert [
+            call.args[0].split("//", 1)[1].split(".", 1)[0]
+            for call in post.await_args_list
+        ] == [
+            "qwen",
+            "qwen",
+            "qwen",
+            "qwen",
+        ]
+        await service.close()
+
+    @pytest.mark.asyncio
+    async def test_live_translategemma_fallback_keeps_existing_no_retry_behavior(self):
+        """Live fallback output is not split when a provider reports its limit."""
+        config = self._service_config()
+        config["routing"][0]["target_langs"].append("bn")
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = config
+            service = TranslationService()
+
+        responses = [
+            _translation_response(
+                "চলুন।\nঅথবা,\nআয়।\n(প্রসঙ্গ অনুযায়ী উপযুক্ত অনুবাদ ব্যবহার করা উচিত।)"
+            ),
+            _translation_response(
+                'লাইভ অংশ\n###TRANSLATION_END###{"translation_quality": 0.8}',
+                "length",
+            ),
+        ]
+        with patch.object(
+            service._http_client,
+            "post",
+            new=AsyncMock(side_effect=responses),
+        ) as post:
+            result = await service._real_translate(
+                "Come on.",
+                "en",
+                "bn",
+                custom_translation_routing=True,
+            )
+
+        assert result.text == "লাইভ অংশ"
+        assert result.translation_quality == 0.8
+        assert post.await_count == 2
+        await service.close()
 
     def test_endpoint_model_placeholder_uses_safe_replacement(self):
         """Test endpoint model substitution only replaces the documented token."""
@@ -767,6 +1304,37 @@ class TestTranslationProviderRouting:
         assert call_args.args[0] == "https://gamma.example.com/v1/chat/completions"
         assert call_args.kwargs["headers"]["Authorization"] == "Bearer gamma-key"
         assert call_args.kwargs["json"]["model"] == "translategamma"
+
+    @pytest.mark.asyncio
+    async def test_public_translate_flag_switches_provider_routing(self):
+        """The public translation API defaults to legacy and opts into routing explicitly."""
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": "નમસ્તે"}}]}
+
+        with patch("app.services.translation_service.get_config") as mock_config:
+            mock_config.return_value.translation = self._service_config()
+            service = TranslationService()
+
+        with patch.object(
+            service._http_client, "post", new_callable=AsyncMock
+        ) as mock_post:
+            mock_post.return_value = response
+            legacy_result = await service.translate("Hello", "en", "gu")
+            custom_result = await service.translate(
+                "Hello", "en", "gu", custom_translation_routing=True
+            )
+
+        assert legacy_result.success is True
+        assert custom_result.success is True
+        assert (
+            mock_post.call_args_list[0].args[0]
+            == "https://qwen.example.com/v1/chat/completions"
+        )
+        assert (
+            mock_post.call_args_list[1].args[0]
+            == "https://gamma.example.com/v1/chat/completions"
+        )
 
     @pytest.mark.asyncio
     async def test_translate_real_mode_forwards_custom_instruction(self):

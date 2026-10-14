@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import get_config
 from .routers import api_router, web_router
-from .routers.api import close_visual_context_service
+from .routers.api import close_pipeline_service, close_visual_context_service
 from .utils.logger import get_logger
 from .version import __version__
 
@@ -81,6 +81,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await close_pipeline_service()
         await close_visual_context_service()
         logger.info("PolyTalk shutting down...")
 

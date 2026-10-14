@@ -1,0 +1,370 @@
+/* SPDX-FileCopyrightText: 2026 BizzAppDev Systems Pvt. Ltd. */
+/* SPDX-License-Identifier: AGPL-3.0-or-later */
+
+.text-translation-card {
+    margin: 22px 0;
+    padding: 20px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 16px;
+    color: white;
+    background: rgba(22, 33, 62, 0.72);
+}
+
+.text-translation-header,
+.text-entry-header,
+.text-output-header,
+.text-translation-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.text-mode-label {
+    color: var(--poly-primary);
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.text-translation-header h2 {
+    margin: 3px 0 0;
+    font-size: 1.2rem;
+}
+
+.action-icon-text-translation {
+    width: 36px;
+    height: 36px;
+    background: #fff;
+    mask: url("data:image/svg+xml,%3Csvg viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath fill='black' d='M3 5.5C3 4.12 4.12 3 5.5 3h12C18.88 3 20 4.12 20 5.5v7c0 1.38-1.12 2.5-2.5 2.5H12l-4.4 4v-4H5.5A2.5 2.5 0 0 1 3 12.5v-7Zm4.3 2.1v1.8h5.2V7.6H7.3Zm15.2 3.9c0-1.38 1.12-2.5 2.5-2.5h1.5v-3h-2.2l-2.3 2.2-1.4-1.4 3-3a1 1 0 0 1 .7-.3H29a1 1 0 0 1 1 1v6.5a2.5 2.5 0 0 1-2.5 2.5H26l-1.8 4.3-1.9-.8 1.6-3.5h-1.9l-1.6 3.5-1.9-.8 1.9-4.4a2.5 2.5 0 0 1 2.3-1.5h1.8v-1.3h-1.5v-1.8h1.5v-1.2h1.8v1.2h2.7v1.8h-2.7v1.3h1.5v1.8h-1.5l-1.1 2.5 1.1-2.5v-1.8Z'/%3E%3C/svg%3E") center / contain no-repeat;
+    -webkit-mask: url("data:image/svg+xml,%3Csvg viewBox='0 0 32 32' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath fill='black' d='M3 5.5C3 4.12 4.12 3 5.5 3h12C18.88 3 20 4.12 20 5.5v7c0 1.38-1.12 2.5-2.5 2.5H12l-4.4 4v-4H5.5A2.5 2.5 0 0 1 3 12.5v-7Zm4.3 2.1v1.8h5.2V7.6H7.3Zm15.2 3.9c0-1.38 1.12-2.5 2.5-2.5h1.5v-3h-2.2l-2.3 2.2-1.4-1.4 3-3a1 1 0 0 1 .7-.3H29a1 1 0 0 1 1 1v6.5a2.5 2.5 0 0 1-2.5 2.5H26l-1.8 4.3-1.9-.8-1.6 3.5-1.9-.8 1.9-4.4a2.5 2.5 0 0 1 2.3-1.5h1.8v-1.3h-1.5v-1.8h1.5v-1.2h1.8v1.2h2.7v1.8h-2.7v1.3h1.5v1.8h-1.5l-1.1 2.5 1.1-2.5v-1.8Z'/%3E%3C/svg%3E") center / contain no-repeat;
+    position: relative;
+    z-index: 2;
+    display: block;
+    pointer-events: none;
+}
+
+/* Reference-style language cards and exchange arrows. */
+svg.action-icon-text-translation {
+    width: 40px;
+    height: 40px;
+    overflow: visible;
+    background: transparent;
+    mask: none;
+    -webkit-mask: none;
+    fill: none;
+    stroke: #fff;
+    stroke-width: 2.2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.45));
+    margin: auto;
+}
+
+svg.action-icon-text-translation::before,
+svg.action-icon-text-translation::after {
+    content: none;
+}
+
+svg.action-icon-text-translation text {
+    fill: #fff;
+    stroke: none;
+    font-family: Arial, sans-serif;
+    font-size: 13px;
+    font-weight: 800;
+}
+
+.btn-text.active {
+    outline: 2px solid rgba(96, 165, 250, 0.8);
+    outline-offset: 3px;
+}
+
+body.text-mode-active #readiness-panel,
+body.text-mode-active #session-controls,
+body.text-mode-active #recording-indicator,
+body.text-mode-active .live-results,
+body.text-mode-active #audio-container {
+    display: none !important;
+}
+
+#text-character-count,
+.text-keyboard-help,
+#text-translation-status {
+    color: #a0aec0;
+    font-size: 0.84rem;
+}
+
+.text-keyboard-help {
+    margin: 8px 0 14px;
+}
+
+.text-translation-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+
+.text-entry-panel,
+.text-output-panel {
+    display: flex;
+    flex-direction: column;
+    min-height: 220px;
+    padding: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    background: rgba(8, 15, 35, 0.55);
+}
+
+.text-entry-header > label,
+.text-output-header > span {
+    margin-bottom: 9px;
+    font-weight: 600;
+}
+
+#text-source-input {
+    flex: 1;
+    width: 100%;
+    resize: vertical;
+    border: 0;
+    outline: 0;
+    color: white;
+    background: transparent;
+    font: inherit;
+    line-height: 1.6;
+}
+
+.text-translation-output {
+    flex: 1;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    line-height: 1.6;
+}
+
+.text-output-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.text-entry-header button,
+.text-output-actions button {
+    padding: 6px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 8px;
+    color: white;
+    background: transparent;
+    cursor: pointer;
+}
+
+.text-entry-header button:disabled,
+.text-output-actions button:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+}
+
+.text-entry-header .text-speaker-button,
+.text-output-actions .text-speaker-button {
+    display: inline-flex;
+    width: 34px;
+    height: 34px;
+    flex: 0 0 34px;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    line-height: 1;
+}
+
+.text-speaker-button svg {
+    display: block;
+    width: 18px;
+    height: 18px;
+    overflow: visible;
+}
+
+.text-speaker-button svg path:first-child {
+    fill: #ffffff;
+    stroke: none;
+}
+
+.text-speaker-button svg path:last-child {
+    fill: none;
+    stroke: #ffffff;
+    stroke-width: 1.6;
+    stroke-linecap: round;
+}
+
+.text-audio-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+    margin-top: 14px;
+}
+
+.text-audio-grid[hidden] {
+    display: none;
+}
+
+.text-audio-panel {
+    min-width: 0;
+    padding: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    background: rgba(8, 15, 35, 0.55);
+}
+
+#text-source-audio-panel,
+#text-translation-audio-panel {
+    grid-column: 1;
+}
+
+.text-audio-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.text-audio-header > div {
+    display: grid;
+    gap: 3px;
+}
+
+.text-audio-kicker {
+    color: var(--poly-primary);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.text-audio-header button {
+    padding: 7px 11px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 8px;
+    color: white;
+    background: transparent;
+    cursor: pointer;
+}
+
+.text-audio-header button:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+}
+
+.text-audio-panel > audio {
+    width: 100%;
+    margin-top: 12px;
+}
+
+.text-translation-footer {
+    justify-content: flex-start;
+    margin-top: 14px;
+}
+
+#text-translation-status[data-state="error"] {
+    color: #fca5a5;
+}
+
+#text-translation-status[data-state="success"] {
+    color: #86efac;
+}
+
+@media (max-width: 720px) {
+    .text-translation-grid,
+    .text-audio-grid {
+        grid-template-columns: 1fr;
+    }
+
+    #text-source-audio-panel,
+    #text-translation-audio-panel {
+        grid-column: 1;
+    }
+}
+
+@media (max-width: 480px) {
+    .text-translation-card {
+        margin: 16px 0;
+        padding: 14px;
+        border-radius: 12px;
+    }
+
+    .text-translation-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+    }
+
+    .text-translation-header h2 {
+        font-size: 1.05rem;
+    }
+
+    #text-character-count {
+        align-self: flex-start;
+        font-weight: 600;
+        margin-top: 2px;
+    }
+
+    .text-keyboard-help {
+        margin: 6px 0 10px;
+        font-size: 0.78rem;
+        line-height: 1.4;
+    }
+
+    .text-entry-panel,
+    .text-output-panel {
+        min-height: 160px;
+        padding: 10px;
+    }
+
+    .text-entry-header > label,
+    .text-output-header > span {
+        margin-bottom: 6px;
+        font-size: 0.82rem;
+    }
+
+    #text-source-input {
+        font-size: 0.95rem;
+        line-height: 1.5;
+    }
+
+    .text-translation-output {
+        font-size: 0.95rem;
+    }
+
+    .text-output-actions {
+        gap: 6px;
+    }
+
+    .text-entry-header button,
+    .text-output-actions button {
+        padding: 5px 8px;
+        font-size: 0.82rem;
+        border-radius: 6px;
+    }
+
+    .text-audio-panel > audio {
+        margin-top: 8px;
+    }
+
+    .text-translation-footer {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 8px;
+        margin-top: 10px;
+    }
+
+    #text-translation-status {
+        text-align: center;
+        font-size: 0.78rem;
+    }
+
+    #text-translate-btn {
+        width: 100%;
+        min-width: 100%;
+        flex: 1 1 100%;
+        padding: 12px 20px;
+        font-size: 0.95rem;
+        height: auto;
+        justify-content: center;
+    }
+}

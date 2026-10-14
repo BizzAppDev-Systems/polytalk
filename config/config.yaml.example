@@ -10,6 +10,83 @@ whisper:
   ping_timeout_seconds: null
   max_reconnect_attempts: 3
   reconnect_delay_seconds: 2
+  routing_enabled: "${STT_ROUTING_ENABLED}"
+  fallback_provider: whisper
+  fallback_replay_max_seconds: "${STT_FALLBACK_REPLAY_MAX_SECONDS}"
+  # Incoming audio must already be mono signed int16 PCM at this rate; raw PCM
+  # has no embedded sample-rate metadata for the utterance splitter to inspect.
+  sample_rate: "${STT_SAMPLE_RATE}"
+  conversation:
+    # faster-whisper performs independent language detection and also provides
+    # a ready fallback transcript while specialized STTs run in parallel.
+    detector_provider: whisper
+    parallel_timeout_seconds: "${STT_CONVERSATION_PARALLEL_TIMEOUT_SECONDS}"
+    # Minimum normalized-confidence lead on a 0.0-1.0 scale. Runtime clamps
+    # this value to 0.01-1.0 so ties cannot bypass the configured default.
+    confidence_margin: "${STT_CONVERSATION_CONFIDENCE_MARGIN}"
+    silence_rms_threshold: "${STT_SILENCE_RMS_THRESHOLD}"
+    pause_seconds: "${STT_PAUSE_FLUSH_SECONDS}"
+    max_utterance_seconds: "${STT_MAX_UTTERANCE_SECONDS}"
+    # faster-whisper is eligible in conversation mode only for explicitly
+    # listed languages that do not have a specialized route.
+    fallback_languages: [ar, id, tr, vi]
+  providers:
+    whisper:
+      enabled: true
+      language_detection: true
+      base_url: "${WHISPER_BASE_URL}"
+      ws_endpoint: "${WHISPER_WS_ENDPOINT}"
+    indicconformer:
+      language_detection: false
+      enabled: "${INDIC_STT_ENABLED}"
+      base_url: "${INDIC_STT_BASE_URL}"
+      ws_endpoint: "/v1/stream/transcriptions"
+    parakeet:
+      # Parakeet selects a transcription language internally but does not
+      # return its detected language code, so it is not a routing LID source.
+      language_detection: false
+      # Parakeet ignores language hints, so one call can serve both languages
+      # when both sides of a conversation route to this provider.
+      language_hint_supported: false
+      enabled: "${PARAKEET_STT_ENABLED}"
+      base_url: "${PARAKEET_STT_BASE_URL}"
+      ws_endpoint: "/v1/stream/transcriptions"
+    sensevoice:
+      language_detection: true
+      enabled: "${SENSEVOICE_STT_ENABLED}"
+      base_url: "${SENSEVOICE_STT_BASE_URL}"
+      ws_endpoint: "/v1/stream/transcriptions"
+  routing:
+    - priority: 10
+      provider: indicconformer
+      languages: [as, bn, brx, doi, gu, hi, kn, kok, ks, mai, ml, mni, mr, ne, or, pa, sa, sat, sd, ta, te, ur]
+    - priority: 20
+      provider: sensevoice
+      languages: [zh, yue, ja, ko]
+    - priority: 30
+      provider: parakeet
+      languages: [en, bg, hr, cs, da, nl, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk]
+
+# Shared server-side voice activity detection. Keep profiles off until their
+# shadow/boundary rollout has passed the recorded-audio regression gates.
+vad:
+  model_path: "app/assets/silero_vad.onnx"
+  positive_threshold: 0.5
+  negative_threshold: 0.35
+  pre_roll_ms: 640
+  start_confirm_ms: 96
+  post_roll_ms: 320
+  max_utterance_seconds: 30
+  profiles:
+    conversation:
+      mode: "${VAD_CONVERSATION_MODE}"
+      end_hangover_ms: 960
+    live_microphone:
+      mode: "${VAD_LIVE_MICROPHONE_MODE}"
+      end_hangover_ms: 1600
+    share:
+      mode: "${VAD_SHARE_MODE}"
+      end_hangover_ms: 1920
 
 translation:
   enabled: true
@@ -26,6 +103,10 @@ translation:
       api_format: "${TRANSLATION_API_FORMAT}"
       api_key: "${TRANSLATION_API_KEY}"
       model: "${TRANSLATION_MODEL}"
+    # "translategamma" is an operator-defined provider ID retained for
+    # deployment compatibility. Configure its API adapter as
+    # TRANSLATEGAMMA_API_FORMAT=translategemma_chat.
+    # See README.md#translation for provider ID and API adapter details.
     translategamma:
       base_url: "${TRANSLATEGAMMA_BASE_URL}"
       endpoint: "${TRANSLATEGAMMA_ENDPOINT}"
@@ -37,19 +118,29 @@ translation:
   # default_provider: qwen3
   # routing:
   #   - priority: 10
-  #     target_langs: [gu, hi, mr]
+  #     target_langs: [as, bn, gu, hi, kn, ml, mr, or, pa, ta, te, ur]
   #     provider: translategamma
   #   - priority: 20
-  #     source_langs: [en]
-  #     provider: qwen3
+  #     source_langs: [as, bn, gu, hi, kn, ml, mr, or, pa, ta, te, ur]
+  #     target_langs: [en]
+  #     provider: translategamma
   temperature: 0.0
   max_tokens: "${TRANSLATION_MAX_TOKENS}"
+  typed_text_max_tokens: "${TRANSLATION_TYPED_TEXT_MAX_TOKENS}"
+  semantic_boundary_enabled: "${SEMANTIC_BOUNDARY_ENABLED}"
+  semantic_boundary_provider: "${SEMANTIC_BOUNDARY_PROVIDER}"
+  semantic_boundary_timeout_seconds: "${SEMANTIC_BOUNDARY_TIMEOUT_SECONDS}"
+  semantic_boundary_min_confidence: "${SEMANTIC_BOUNDARY_MIN_CONFIDENCE}"
+  semantic_boundary_max_tokens: "${SEMANTIC_BOUNDARY_MAX_TOKENS}"
+  semantic_boundary_disable_thinking: "${SEMANTIC_BOUNDARY_DISABLE_THINKING}"
+  semantic_boundary_chat_template_kwargs_enabled: "${SEMANTIC_BOUNDARY_CHAT_TEMPLATE_KWARGS_ENABLED}"
+  semantic_boundary_probe_cooldown_seconds: "${SEMANTIC_BOUNDARY_PROBE_COOLDOWN_SECONDS}"
   context_enabled: true
   context_max_chunks: 4
   context_max_chars: 1200
   context_payload_warn_chars: 2000
   custom_instruction_max_chars: "${CUSTOM_INSTRUCTION_MAX_CHARS}"
-  system_prompt: "You are a professional translator. Translate from {source_language} to {target_language}. Write natural, fluent {target_language}. Preserve the meaning only; do not add explanations, summaries, repeated text, or source-language commentary. If the source transcript is fragmented, translate the intended meaning as faithfully as possible. Return ONLY the translation."
+  system_prompt: "You are a professional translator. Translate from {source_language} to {target_language}. Write natural, fluent {target_language}. Preserve the meaning only; do not add explanations, summaries, repeated text, or source-language commentary. If the source transcript is fragmented, translate the intended meaning as faithfully as possible.\n\nReturn the translation text. IMMEDIATELY after the translation, on a new line, append ###TRANSLATION_END###{{\"translation_quality\": 0.XX}} where X.X is a float between 0.0 and 1.0 representing your confidence in the translation quality. This JSON block is REQUIRED and must be included at the end of every response. Do NOT omit it.\n\nExample output:\n{{translation text here}}\n###TRANSLATION_END###{{\"translation_quality\": 0.95}}"
 
 visual_context:
   enabled: "${VISUAL_CONTEXT_ENABLED}"
@@ -72,6 +163,20 @@ tts:
   providers:
     piper:
       base_url: "${TTS_BASE_URL}"
+    indic_parler:
+      base_url: "${INDIC_PARLER_TTS_BASE_URL}"
+      gender: "${INDIC_PARLER_TTS_GENDER}"
+      voice: "${INDIC_PARLER_TTS_VOICE}"
+      pace: "${INDIC_PARLER_TTS_PACE}"
+      paces:
+        gu: "${INDIC_PARLER_TTS_GU_PACE}"
+        or: "${INDIC_PARLER_TTS_OR_PACE}"
+      speed: "${INDIC_PARLER_TTS_SPEED}"
+      speeds:
+        gu: "${INDIC_PARLER_TTS_GU_SPEED}"
+        or: "${INDIC_PARLER_TTS_OR_SPEED}"
+      description: "${INDIC_PARLER_TTS_DESCRIPTION}"
+      timeout_seconds: "${INDIC_PARLER_TTS_TIMEOUT}"
     supertonic:
       base_url: "${SUPERTONIC_TTS_BASE_URL}"
       voice: "${SUPERTONIC_TTS_VOICE}"
@@ -81,12 +186,26 @@ tts:
       voices:
         ja: "${SUPERTONIC_TTS_JA_VOICE}"
         ko: "${SUPERTONIC_TTS_KO_VOICE}"
+  fallback_provider: piper
   language_providers:
+    as: "indic_parler"
+    bn: "indic_parler"
+    brx: "indic_parler"
+    gu: "indic_parler"
+    hi: "indic_parler"
+    kn: "indic_parler"
+    ml: "indic_parler"
+    mni: "indic_parler"
+    mr: "indic_parler"
+    or: "indic_parler"
+    pa: "indic_parler"
+    ta: "indic_parler"
+    te: "indic_parler"
+    ur: "indic_parler"
     ar: "supertonic"
     bg: "supertonic"
     hr: "supertonic"
     et: "supertonic"
-    hi: "supertonic"
     ru: "supertonic"
     id: "supertonic"
     vi: "supertonic"
@@ -137,3 +256,5 @@ app:
   translation_flush_chars: "${TRANSLATION_FLUSH_CHARS}"
   translation_flush_seconds: "${TRANSLATION_FLUSH_SECONDS}"
   translation_flush_min_chars: "${TRANSLATION_FLUSH_MIN_CHARS}"
+  translation_pause_commit_mode: "${TRANSLATION_PAUSE_COMMIT_MODE}"
+  translation_semantic_hard_seconds: "${TRANSLATION_SEMANTIC_HARD_SECONDS}"

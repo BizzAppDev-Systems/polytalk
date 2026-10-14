@@ -5,13 +5,14 @@
 Tests for whisper service methods.
 """
 
+import asyncio
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import websockets.exceptions
 
-from app.services.whisper_service import WhisperService, TranscriptionResult
+from app.services.whisper_service import TranscriptionResult, WhisperService
 
 
 class TestWhisperServiceInit:
@@ -442,8 +443,8 @@ class TestWhisperStreamTranscribe:
     @pytest.mark.asyncio
     async def test_estimate_audio_duration_valid_wav(self):
         """Test audio duration estimation with valid WAV."""
-        import wave
         import io
+        import wave
 
         with patch("app.services.whisper_service.get_config") as mock_config:
             mock_config.return_value.whisper = {
@@ -720,6 +721,56 @@ class TestWhisperStreamTranscribe:
 
                 # May or may not have results depending on error handling path
                 assert isinstance(results, list)
+
+    @pytest.mark.asyncio
+    async def test_utterance_boundary_sends_flush_without_ending_stream(self):
+        """The pipeline sentinel becomes flush, followed later by the real end."""
+        with patch("app.services.whisper_service.get_config") as mock_config:
+            mock_config.return_value.whisper = {
+                "enabled": True,
+                "mock_mode": False,
+                "base_url": "http://stt:8000",
+                "ws_endpoint": "/v1/stream/transcriptions",
+                "max_reconnect_attempts": 1,
+            }
+            service = WhisperService()
+
+        end_sent = asyncio.Event()
+        sent = []
+
+        async def audio_gen():
+            yield b"__END_OF_UTTERANCE__"
+            yield b"__END_SIGNAL__"
+
+        class MockWebSocket:
+            async def send(self, data):
+                sent.append(data)
+                if isinstance(data, str) and json.loads(data).get("type") == "end":
+                    end_sent.set()
+
+            async def recv(self):
+                await end_sent.wait()
+                raise websockets.exceptions.ConnectionClosedOK()
+
+            async def close(self):
+                pass
+
+        with patch(
+            "app.services.whisper_service.websockets.connect",
+            new=AsyncMock(return_value=MockWebSocket()),
+        ):
+            results = [
+                result
+                async for result in service._real_stream_transcribe(
+                    audio_gen(), language="en"
+                )
+            ]
+
+        controls = [json.loads(message) for message in sent if isinstance(message, str)]
+        assert {"type": "flush", "reason": "client_flush"} in controls
+        assert controls[-1] == {"type": "end"}
+        assert results == []
+        await service.close()
 
     @pytest.mark.asyncio
     async def test_real_stream_websocket_success(self):

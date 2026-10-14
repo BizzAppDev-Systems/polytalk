@@ -1,14 +1,27 @@
 """Tests for service classes."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.config import Config
-from app.services.pipeline_service import TranslationPipelineService
+from app.services.pipeline_service import (
+    TranslationPipelineService,
+    _semantic_probe_is_cooling_down,
+)
+from app.services.translation_cache import (
+    EMPTY_HASH,
+    TranslationCache,
+    make_cache_key,
+    normalize_text,
+)
+from app.services.translation_service import (
+    SemanticBoundaryDecision,
+    TranslationService,
+)
 from app.services.tts_service import TTSService
-from app.services.translation_service import TranslationService
 from app.services.whisper_service import WhisperService
 
 
@@ -80,6 +93,31 @@ class TestWhisperService:
         )
         assert "स्पीच" in result_hi.text or result_hi.language == "hi"
 
+    @pytest.mark.asyncio
+    async def test_mock_transcription_logs_metadata_without_customer_text(self, caplog):
+        """Mock transcription completion logs must not contain transcript text."""
+        service = WhisperService()
+        service.mock_mode = True
+        results = []
+
+        with (
+            caplog.at_level(
+                logging.INFO,
+                logger="app.services.whisper_service",
+            ),
+            patch(
+                "app.services.whisper_service.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            async for result in service.stream_transcribe(b"audio", language="en"):
+                results.append(result)
+
+        final_transcript = results[-1].text
+        assert final_transcript not in caplog.text
+        assert "Mock streaming transcription complete: language=en" in caplog.text
+        assert f"chars={len(final_transcript)}" in caplog.text
+
     def test_whisper_transcribe_unknown_language_mock(self):
         """Test transcription with unknown language."""
         import asyncio
@@ -136,6 +174,60 @@ class TestTranslationService:
         assert result.source_language == "en"
         assert result.target_language == "gu"
         assert result.success is True
+
+    def test_translation_logs_metadata_without_customer_text(self, caplog):
+        """Translation progress logs must not contain customer text."""
+        service = TranslationService()
+        service.mock_mode = True
+        source_text = "private customer transcript"
+
+        with caplog.at_level(
+            logging.INFO,
+            logger="app.services.translation_service",
+        ):
+            result = asyncio.run(service.translate(source_text, "en", "gu"))
+
+        assert source_text not in caplog.text
+        assert result.text not in caplog.text
+        assert "Mock translation complete: en -> gu" in caplog.text
+        assert f"source_chars={len(source_text)}" in caplog.text
+        assert f"translated_chars={len(result.text)}" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_real_translation_logs_metadata_without_customer_text(self, caplog):
+        """Real-provider completion logs must not contain customer text."""
+        service = TranslationService()
+        source_text = "private real provider transcript"
+        translated_text = "private real provider translation"
+        provider = {"api_format": "openai_chat"}
+
+        with (
+            caplog.at_level(
+                logging.INFO,
+                logger="app.services.translation_service",
+            ),
+            patch.object(
+                service,
+                "_resolve_provider_config",
+                return_value=provider,
+            ),
+            patch.object(
+                service,
+                "_build_translation_request",
+                return_value=("https://provider.invalid", {}, {}),
+            ),
+            patch.object(
+                service,
+                "_execute_translation_request",
+                new_callable=AsyncMock,
+                return_value=(translated_text, 0.9),
+            ),
+        ):
+            result = await service._real_translate(source_text, "en", "bn")
+
+        assert result.success is True
+        assert source_text not in caplog.text
+        assert translated_text not in caplog.text
 
     def test_translation_translate_disabled(self):
         """Test translation when API is disabled."""
@@ -386,6 +478,50 @@ class TestTranslationPipelineService:
                 mock_audio_gen(), "en", "gu", pause_event=pause_event
             ):
                 pass
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["live", "conversation"])
+    async def test_process_streaming_end_signal_bypasses_pause(self, mode):
+        """Stopping a paused session still terminates the downstream STT stream."""
+        pipeline = TranslationPipelineService(warm_connections=False)
+        pause_event = asyncio.Event()
+        pause_event.set()
+        received_chunks = []
+
+        async def mock_audio_gen():
+            yield b"__END_SIGNAL__"
+
+        async def mock_stream_transcribe(audio_generator, *_args, **_kwargs):
+            async for chunk in audio_generator:
+                received_chunks.append(chunk)
+            yield MagicMock(
+                success=True,
+                text="",
+                language="en",
+                is_partial=False,
+                metrics={},
+            )
+
+        async def consume_pipeline():
+            return [
+                result
+                async for result in pipeline.process_streaming(
+                    mock_audio_gen(),
+                    "en",
+                    "gu",
+                    pause_event=pause_event,
+                    mode=mode,
+                )
+            ]
+
+        with patch.object(
+            pipeline.whisper,
+            "stream_transcribe",
+            side_effect=mock_stream_transcribe,
+        ):
+            await asyncio.wait_for(consume_pipeline(), timeout=1.0)
+
+        assert received_chunks == [b"__END_SIGNAL__"]
 
     @pytest.mark.asyncio
     async def test_process_streaming_with_language_swap(self):
@@ -844,6 +980,63 @@ class TestTranslationPipelineService:
                     assert len(results) > 0
 
     @pytest.mark.asyncio
+    async def test_pipeline_logs_progress_without_customer_text(self, caplog):
+        """Pipeline progress logs must not contain ASR or translated text."""
+        pipeline = TranslationPipelineService(warm_connections=False)
+        source_text = "private pipeline transcript with enough words."
+        translated_text = "private pipeline translated output."
+
+        async def mock_audio_gen():
+            yield b"audio_chunk"
+            yield b"__END_SIGNAL__"
+
+        async def mock_stream_transcribe(*args, **kwargs):
+            yield MagicMock(
+                success=True,
+                text=source_text,
+                language="en",
+                is_partial=False,
+                metrics={},
+            )
+
+        async def mock_translate(*args, **kwargs):
+            return MagicMock(
+                success=True,
+                text=translated_text,
+                source_language="en",
+                target_language="bn",
+            )
+
+        async def mock_synthesize(*args, **kwargs):
+            return MagicMock(success=True, audio_url="/tmp/test.wav")
+
+        with (
+            caplog.at_level(
+                logging.DEBUG,
+                logger="app.services.pipeline_service",
+            ),
+            patch.object(
+                pipeline.whisper,
+                "stream_transcribe",
+                return_value=mock_stream_transcribe(),
+            ),
+            patch.object(pipeline.translation, "translate", mock_translate),
+            patch.object(pipeline.tts, "synthesize", mock_synthesize),
+        ):
+            results = [
+                result
+                async for result in pipeline.process_streaming(
+                    mock_audio_gen(), "en", "bn"
+                )
+            ]
+
+        assert results
+        assert source_text not in caplog.text
+        assert translated_text not in caplog.text
+        assert "ASR progress: language=en" in caplog.text
+        assert "en -> bn" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_process_streaming_backtrack_shorter_text(self):
         """Test backtrack handling when current text is shorter than last."""
         pipeline = TranslationPipelineService(warm_connections=False)
@@ -987,9 +1180,234 @@ class TestTranslationPipelineService:
                     )
 
     @pytest.mark.asyncio
-    async def test_process_streaming_translation_retry_on_failure(self):
+    async def test_session_pacing_commits_immediately_on_acoustic_pause(self):
+        """The default policy trusts an explicit acoustic pause marker."""
+        pipeline = TranslationPipelineService(warm_connections=False)
+        release_asr = asyncio.Event()
+        transcript_seen = asyncio.Event()
+        translation_seen = asyncio.Event()
+
+        async def mock_audio_gen():
+            yield b"audio_chunk"
+
+        async def mock_stream_transcribe(*args, **kwargs):
+            yield MagicMock(
+                success=True,
+                text="A short pause",
+                language="en",
+                is_partial=True,
+                metrics={"force_emit": True},
+            )
+            await release_asr.wait()
+
+        async def translate_on_pause(*args, **kwargs):
+            translation_seen.set()
+            return MagicMock(success=True, text="translated", language="en")
+
+        mock_translate = AsyncMock(side_effect=translate_on_pause)
+        mock_synthesize = AsyncMock(
+            return_value=MagicMock(success=True, audio_url="/tmp/test.wav")
+        )
+        results = []
+
+        async def collect_results():
+            async for result in pipeline.process_streaming(
+                mock_audio_gen(),
+                "en",
+                "gu",
+                translation_buffer_seconds=10.0,
+            ):
+                results.append(result)
+                if result.get("type") == "transcription":
+                    transcript_seen.set()
+
+        with (
+            patch.object(
+                pipeline.whisper,
+                "stream_transcribe",
+                return_value=mock_stream_transcribe(),
+            ),
+            patch.object(pipeline.translation, "translate", mock_translate),
+            patch.object(pipeline.tts, "synthesize", mock_synthesize),
+        ):
+            collector = asyncio.create_task(collect_results())
+            await asyncio.wait_for(transcript_seen.wait(), timeout=1.0)
+            await asyncio.wait_for(translation_seen.wait(), timeout=1.0)
+            mock_translate.assert_awaited_once()
+            release_asr.set()
+            await asyncio.wait_for(collector, timeout=2.0)
+
+        mock_translate.assert_awaited_once()
+        assert any(result.get("type") == "translation" for result in results)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "transcript_metrics",
+        [{"force_emit": True}, {}],
+        ids=["acoustic-pause", "stt-cadence"],
+    )
+    async def test_semantic_pause_commits_prefix_and_retains_fragment(
+        self, transcript_metrics
+    ):
+        """Semantic mode handles both pause and regular cadence transcripts."""
+        pipeline = TranslationPipelineService(warm_connections=False)
+
+        async def mock_audio_gen():
+            yield b"audio_chunk"
+
+        async def mock_stream_transcribe(*args, **kwargs):
+            yield MagicMock(
+                success=True,
+                text="Meeting is on Friday Do not forget to",
+                language="en",
+                is_partial=True,
+                metrics=transcript_metrics,
+            )
+            yield MagicMock(
+                success=True,
+                text="Meeting is on Friday Do not forget to bring notes",
+                language="en",
+                is_partial=False,
+                metrics={},
+            )
+
+        app_config = {
+            "translation_pause_commit_mode": "semantic",
+            "translation_semantic_hard_seconds": 10.0,
+            "translation_flush_seconds": 6.0,
+            "translation_flush_chars": 120,
+            "translation_flush_min_chars": 40,
+        }
+        config = MagicMock(app=app_config, translation={})
+        boundary = SemanticBoundaryDecision(
+            boundary=len("Meeting is on Friday"),
+            confidence=0.96,
+        )
+        mock_translate = AsyncMock(
+            return_value=MagicMock(success=True, text="translated", language="en")
+        )
+        mock_synthesize = AsyncMock(
+            return_value=MagicMock(success=True, audio_url="/tmp/test.wav")
+        )
+
+        with (
+            patch("app.config.get_config", return_value=config),
+            patch.object(
+                pipeline.whisper,
+                "stream_transcribe",
+                return_value=mock_stream_transcribe(),
+            ),
+            patch.object(
+                pipeline.translation,
+                "select_semantic_boundary",
+                new=AsyncMock(return_value=boundary),
+            ),
+            patch.object(pipeline.translation, "translate", mock_translate),
+            patch.object(pipeline.tts, "synthesize", mock_synthesize),
+        ):
+            results = [
+                result
+                async for result in pipeline.process_streaming(
+                    mock_audio_gen(),
+                    "en",
+                    "gu",
+                    translation_buffer_seconds=6.0,
+                )
+            ]
+
+        assert mock_translate.await_args_list[0].args[0] == "Meeting is on Friday"
+        assert (
+            mock_translate.await_args_list[1].args[0] == "Do not forget to bring notes"
+        )
+        assert any(result.get("type") == "translation" for result in results)
+
+    def test_semantic_selector_cooldown_only_limits_cadence_probes(self):
+        """Explicit acoustic pauses bypass the normal cadence cost guard."""
+        assert _semantic_probe_is_cooling_down(10.0, 11.0, 3.0)
+        assert not _semantic_probe_is_cooling_down(
+            10.0,
+            11.0,
+            3.0,
+            bypass=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_semantic_acoustic_pauses_bypass_selector_cooldown(self):
+        """Each explicit pause promptly asks for a safe semantic prefix."""
+        pipeline = TranslationPipelineService(warm_connections=False)
+
+        async def mock_audio_gen():
+            yield b"audio_chunk"
+
+        async def mock_stream_transcribe(*args, **kwargs):
+            yield MagicMock(
+                success=True,
+                text="Meeting is on Friday Do not",
+                language="en",
+                is_partial=True,
+                metrics={"force_emit": True},
+            )
+            yield MagicMock(
+                success=True,
+                text="Meeting is on Friday Do not forget",
+                language="en",
+                is_partial=True,
+                metrics={"force_emit": True},
+            )
+
+        app_config = {
+            "translation_pause_commit_mode": "semantic",
+            "translation_semantic_hard_seconds": 10.0,
+            "translation_flush_seconds": 6.0,
+            "translation_flush_chars": 120,
+            "translation_flush_min_chars": 40,
+        }
+        translation_config = {
+            "semantic_boundary_probe_cooldown_seconds": 3.0,
+        }
+        config = MagicMock(app=app_config, translation=translation_config)
+        mock_selector = AsyncMock(return_value=None)
+        mock_translate = AsyncMock(
+            return_value=MagicMock(success=True, text="translated", language="en")
+        )
+        mock_synthesize = AsyncMock(
+            return_value=MagicMock(success=True, audio_url="/tmp/test.wav")
+        )
+
+        with (
+            patch("app.config.get_config", return_value=config),
+            patch.object(
+                pipeline.whisper,
+                "stream_transcribe",
+                return_value=mock_stream_transcribe(),
+            ),
+            patch.object(
+                pipeline.translation,
+                "select_semantic_boundary",
+                new=mock_selector,
+            ),
+            patch.object(pipeline.translation, "translate", mock_translate),
+            patch.object(pipeline.tts, "synthesize", mock_synthesize),
+        ):
+            results = [
+                result
+                async for result in pipeline.process_streaming(
+                    mock_audio_gen(),
+                    "en",
+                    "gu",
+                    translation_buffer_seconds=6.0,
+                )
+            ]
+
+        assert mock_selector.await_count == 2
+        mock_translate.assert_awaited_once()
+        assert any(result.get("type") == "translation" for result in results)
+
+    @pytest.mark.asyncio
+    async def test_process_streaming_translation_retry_on_failure(self, caplog):
         """Test translation retry logic when first attempt fails."""
         pipeline = TranslationPipelineService(warm_connections=False)
+        provider_error = "private transcript echoed by provider"
 
         async def mock_audio_gen():
             yield b"audio_chunk"
@@ -1017,7 +1435,7 @@ class TestTranslationPipelineService:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return MagicMock(success=False, text="", error="API error")
+                return MagicMock(success=False, text="", error=provider_error)
             return MagicMock(success=True, text="translated", language="en")
 
         async def mock_synthesize(*args, **kwargs):
@@ -1036,6 +1454,8 @@ class TestTranslationPipelineService:
                         results.append(result)
 
                     assert len(results) > 0
+                    assert provider_error not in caplog.text
+                    assert "Failed to flush buffer (asr done)" in caplog.text
 
     @pytest.mark.asyncio
     async def test_process_streaming_translation_all_retries_fail(self):
@@ -2457,3 +2877,998 @@ async def test_conversation_mode_keeps_two_character_turns():
         ("ok", "ठीक है"),
     ]
     assert translation.calls == [("ok", "en", "hi")]
+
+
+@pytest.mark.asyncio
+async def test_live_mode_tts_toggle_off_during_streaming():
+    """Live mode stops TTS after runtime tts_enabled=False update."""
+    from app.services.base import TranscriptionResult, TranslationResult, TTSResult
+
+    class FakeWhisper:
+        mock_mode = True
+
+        async def close(self):
+            pass
+
+        async def stream_transcribe(
+            self,
+            audio_generator,
+            language=None,
+            emit_policy="live",
+            candidate_languages=None,
+            on_result=None,
+            **_kwargs,
+        ):
+            yield TranscriptionResult(text="Guten Morgen", language="de")
+
+    class FakeTranslation:
+        mock_mode = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def close(self):
+            pass
+
+        async def translate(self, text, source_language, target_language, **kwargs):
+            self.calls.append((text, source_language, target_language))
+            return TranslationResult(text="Good morning", success=True)
+
+    class FakeTTS:
+        async def close(self):
+            pass
+
+        async def synthesize(self, text, language, output_path=None):
+            return TTSResult(audio_url=f"/media/output/{language}.wav", success=True)
+
+    async def audio_generator():
+        yield b"pcm"
+        yield b"__END_SIGNAL__"
+
+    translation = FakeTranslation()
+    pipeline = TranslationPipelineService(
+        whisper_service=FakeWhisper(),
+        translation_service=translation,
+        tts_service=FakeTTS(),
+        warm_connections=False,
+    )
+
+    results = [
+        item
+        async for item in pipeline.process_streaming(
+            audio_generator(),
+            "de",
+            "en",
+            mode="live",
+            tts_enabled=False,
+        )
+    ]
+
+    assert [item for item in results if item.get("type") == "transcription"]
+    tts_results = [item for item in results if item.get("type") == "tts"]
+    assert tts_results == []
+    assert translation.calls == [("Guten Morgen", "de", "en")]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_mode_queue_runtime_updates_drains_stale_tts():
+    """Pipeline mode queue updates translation/tts state and drains stale TTS items."""
+    from app.services.base import TranscriptionResult, TranslationResult, TTSResult
+
+    class FakeWhisper:
+        mock_mode = True
+
+        async def close(self):
+            pass
+
+        async def stream_transcribe(
+            self,
+            audio_generator,
+            language=None,
+            emit_policy="live",
+            candidate_languages=None,
+            on_result=None,
+            **_kwargs,
+        ):
+            yield TranscriptionResult(text="Guten Morgen", language="de")
+
+    class FakeTranslation:
+        mock_mode = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def close(self):
+            pass
+
+        async def translate(self, text, source_language, target_language, **kwargs):
+            self.calls.append((text, source_language, target_language))
+            return TranslationResult(text="Good morning", success=True)
+
+    class FakeTTS:
+        def __init__(self):
+            self.synth_count = 0
+
+        async def close(self):
+            pass
+
+        async def synthesize(self, text, language, output_path=None):
+            self.synth_count += 1
+            return TTSResult(audio_url=f"/media/output/{language}.wav", success=True)
+
+    async def audio_generator():
+        yield b"pcm"
+        yield b"__END_SIGNAL__"
+
+    pipeline_mode_queue = asyncio.Queue(maxsize=1)
+    pipeline_mode_queue.put_nowait("transcript")
+    translation = FakeTranslation()
+    tts_service = FakeTTS()
+    pipeline = TranslationPipelineService(
+        whisper_service=FakeWhisper(),
+        translation_service=translation,
+        tts_service=tts_service,
+        warm_connections=False,
+    )
+
+    results = [
+        item
+        async for item in pipeline.process_streaming(
+            audio_generator(),
+            "de",
+            "en",
+            mode="live",
+            pipeline_mode_queue=pipeline_mode_queue,
+            translation_enabled=True,
+            tts_enabled=True,
+        )
+    ]
+
+    # Transcript mode disables translation and TTS.
+    transcription_items = [
+        item for item in results if item.get("type") == "transcription"
+    ]
+    tts_items = [item for item in results if item.get("type") == "tts"]
+    translation_results = [
+        item for item in results if item.get("type") == "translation"
+    ]
+    assert transcription_items != []
+    assert tts_items == []
+    assert translation_results == []
+    assert translation.calls == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_mode_queue_runtime_translation_toggle():
+    """Transcript mode disables translation at runtime."""
+    from app.services.base import TranscriptionResult, TranslationResult, TTSResult
+
+    class FakeWhisper:
+        mock_mode = True
+
+        async def close(self):
+            pass
+
+        async def stream_transcribe(
+            self,
+            audio_generator,
+            language=None,
+            emit_policy="live",
+            candidate_languages=None,
+            on_result=None,
+            **_kwargs,
+        ):
+            yield TranscriptionResult(text="Hallo Welt", language="de")
+
+    class FakeTranslation:
+        def __init__(self):
+            self.calls = []
+
+        async def close(self):
+            pass
+
+        async def translate(self, text, source_language, target_language, **kwargs):
+            self.calls.append((text, source_language, target_language))
+            return TranslationResult(text="Hello World", success=True)
+
+    class FakeTTS:
+        async def close(self):
+            pass
+
+        async def synthesize(self, text, language, output_path=None):
+            return TTSResult(audio_url=f"/media/output/{language}.wav", success=True)
+
+    async def audio_generator():
+        yield b"pcm"
+        yield b"__END_SIGNAL__"
+
+    pipeline_mode_queue = asyncio.Queue(maxsize=1)
+    pipeline_mode_queue.put_nowait("transcript")
+    translation = FakeTranslation()
+    pipeline = TranslationPipelineService(
+        whisper_service=FakeWhisper(),
+        translation_service=translation,
+        tts_service=FakeTTS(),
+        warm_connections=False,
+    )
+
+    results = [
+        item
+        async for item in pipeline.process_streaming(
+            audio_generator(),
+            "de",
+            "en",
+            mode="live",
+            pipeline_mode_queue=pipeline_mode_queue,
+            translation_enabled=False,
+            tts_enabled=False,
+        )
+    ]
+
+    # Transcript mode keeps translation and TTS disabled.
+    translation_results = [
+        item for item in results if item.get("type") == "translation"
+    ]
+    assert translation_results == []
+    assert translation.calls == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_mode_queue_drain_stale_tts_on_mode_switch():
+    """The translation_tts mode enables translation and TTS at runtime.
+
+    The pipeline_mode_queue is consumed by drain_translation_enabled_updates()
+    during translation buffer flush. Capabilities are derived from the stable
+    mode name.
+
+    Note: The async pipeline doesn't guarantee TTS results arrive before the
+    "complete" signal, so we verify translation happens (proving mode was
+    consumed) and TTS was requested (synth_count > 0) rather than checking
+    for TTS result items in the output.
+    """
+    import asyncio as _asyncio
+
+    from app.services.base import TranscriptionResult, TranslationResult, TTSResult
+
+    class FakeWhisper:
+        mock_mode = True
+
+        async def close(self):
+            pass
+
+        async def stream_transcribe(
+            self,
+            audio_generator,
+            language=None,
+            emit_policy="live",
+            candidate_languages=None,
+            on_result=None,
+            **_kwargs,
+        ):
+            yield TranscriptionResult(text="Test text", language="en")
+
+    class FakeTranslation:
+        def __init__(self):
+            self.calls = []
+
+        async def close(self):
+            pass
+
+        async def translate(self, text, source_language, target_language, **kwargs):
+            self.calls.append((text, source_language, target_language))
+            return TranslationResult(text="Text traduit", success=True)
+
+    class FakeTTS:
+        def __init__(self):
+            self.synth_count = 0
+
+        async def close(self):
+            pass
+
+        async def synthesize(self, text, language, output_path=None):
+            self.synth_count += 1
+            return TTSResult(audio_url=f"/media/output/{language}.wav", success=True)
+
+    async def audio_generator():
+        yield b"pcm"
+        yield b"__END_SIGNAL__"
+
+    pipeline_mode_queue = _asyncio.Queue(maxsize=1)
+    pipeline_mode_queue.put_nowait("translation_tts")
+    translation = FakeTranslation()
+    tts_service = FakeTTS()
+    pipeline = TranslationPipelineService(
+        whisper_service=FakeWhisper(),
+        translation_service=translation,
+        tts_service=tts_service,
+        warm_connections=False,
+    )
+
+    results = []
+    async for item in pipeline.process_streaming(
+        audio_generator(),
+        "en",
+        "fr",
+        mode="live",
+        pipeline_mode_queue=pipeline_mode_queue,
+        translation_enabled=True,
+        tts_enabled=True,
+    ):
+        results.append(item)
+
+    # Collect all item types
+    all_types = [item.get("type") for item in results]
+    translation_results = [
+        item for item in results if item.get("type") == "translation"
+    ]
+
+    # translation_tts is the full pipeline.
+    # Pipeline mode queue was consumed, translation happened
+    assert translation_results != [], f"Expected translations, got types: {all_types}"
+    assert translation.calls == [
+        ("Test text", "en", "fr")
+    ], f"Translation calls: {translation.calls}"
+    # TTS was requested (synth called) proving tts_enabled=True after drain
+    assert (
+        tts_service.synth_count == 1
+    ), f"TTS synth_count should be 1, got {tts_service.synth_count}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result_mode", "expected_translation", "expected_tts"),
+    [
+        ("transcript", "", 0),
+        ("translation", "Hello", 0),
+        ("translation_tts", "Hello", 1),
+    ],
+)
+async def test_conversation_mode_honors_result_mode(
+    result_mode, expected_translation, expected_tts
+):
+    """Conversation emits every turn while skipping disabled pipeline stages."""
+    from app.services.base import TranscriptionResult, TranslationResult, TTSResult
+
+    class FakeWhisper:
+        mock_mode = True
+
+        async def close(self):
+            pass
+
+        async def stream_transcribe(
+            self,
+            audio_generator,
+            language=None,
+            emit_policy="live",
+            candidate_languages=None,
+            **kwargs,
+        ):
+            yield TranscriptionResult(text="Hallo", language="de")
+
+    class FakeTranslation:
+        mock_mode = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def close(self):
+            pass
+
+        async def translate(self, text, source_language, target_language, **kwargs):
+            self.calls += 1
+            return TranslationResult(text="Hello", success=True)
+
+    class FakeTTS:
+        def __init__(self):
+            self.calls = 0
+
+        async def close(self):
+            pass
+
+        async def synthesize(self, text, language, output_path=None):
+            self.calls += 1
+            return TTSResult(audio_url="/media/output/en.wav", success=True)
+
+    async def audio_generator():
+        yield b"pcm"
+        yield b"__END_SIGNAL__"
+
+    mode_queue = asyncio.Queue(maxsize=1)
+    mode_queue.put_nowait(result_mode)
+    translation = FakeTranslation()
+    tts = FakeTTS()
+    pipeline = TranslationPipelineService(
+        whisper_service=FakeWhisper(),
+        translation_service=translation,
+        tts_service=tts,
+        warm_connections=False,
+    )
+
+    results = [
+        item
+        async for item in pipeline.process_streaming(
+            audio_generator(),
+            "de",
+            "en",
+            mode="conversation",
+            pipeline_mode_queue=mode_queue,
+        )
+    ]
+
+    turns = [item for item in results if item.get("type") == "conversation_turn"]
+    assert [(turn["transcript"], turn["translated_text"]) for turn in turns] == [
+        ("Hallo", expected_translation)
+    ]
+    assert translation.calls == (0 if result_mode == "transcript" else 1)
+
+
+class TestTranslationCache:
+    """Tests for Redis-backed translation cache."""
+
+    def test_normalize_text_lowercase(self):
+        """Text normalization converts to lowercase."""
+        assert normalize_text("Hello World") == "hello world"
+
+    def test_normalize_text_strips_whitespace(self):
+        """Text normalization strips leading/trailing whitespace."""
+        assert normalize_text("  hello  ") == "hello"
+
+    def test_normalize_text_collapse_internal_whitespace(self):
+        """Text normalization collapses multiple spaces."""
+        assert normalize_text("hello   world") == "hello world"
+
+    def test_normalize_text_removes_punctuation(self):
+        """Text normalization removes punctuation except spaces, hyphens, and apostrophes."""
+        assert normalize_text("Hello, world!") == "hello world"
+        assert normalize_text("What's up?") == "what's up"
+
+    def test_normalize_text_preserves_hyphens(self):
+        """Text normalization preserves hyphens."""
+        assert normalize_text("well-known") == "well-known"
+
+    def test_normalize_text_empty_string(self):
+        """Empty string stays empty."""
+        assert normalize_text("") == ""
+
+    def test_make_cache_key_format_no_instruction_no_glossary(self):
+        """Cache key format is correct when instruction and glossary are None."""
+        key = make_cache_key("en", "de", "hello")
+        parts = key.split(":")
+        assert parts[0] == "pt"
+        assert parts[1] == "cache"
+        assert parts[2] == "en"
+        assert parts[3] == "de"
+        assert len(parts[4]) == 32  # text hash
+        assert parts[5] == "none"  # no instruction
+        assert parts[6] == "none"  # no glossary
+
+    def test_make_cache_key_format_with_instruction_and_glossary(self):
+        """Cache key format is correct when instruction and glossary are provided."""
+        key = make_cache_key(
+            "en", "de", "hello", custom_instruction="formal", glossary_terms=["dinner"]
+        )
+        parts = key.split(":")
+        assert parts[0] == "pt"
+        assert parts[1] == "cache"
+        assert parts[2] == "en"
+        assert parts[3] == "de"
+        assert len(parts[4]) == 32  # text hash
+        assert len(parts[5]) == 32  # instruction hash
+        assert len(parts[6]) == 32  # glossary hash
+
+    def test_make_cache_key_deterministic(self):
+        """Same input produces same cache key."""
+        key1 = make_cache_key("en", "de", "hello world")
+        key2 = make_cache_key("en", "de", "hello world")
+        assert key1 == key2
+
+    def test_make_cache_key_different_languages(self):
+        """Different language pairs produce different keys."""
+        key1 = make_cache_key("en", "de", "hello")
+        key2 = make_cache_key("en", "fr", "hello")
+        assert key1 != key2
+
+    def test_make_cache_key_different_text(self):
+        """Different text produces different keys."""
+        key1 = make_cache_key("en", "de", "hello")
+        key2 = make_cache_key("en", "de", "world")
+        assert key1 != key2
+
+    def test_make_cache_key_empty_text(self):
+        """Empty text returns empty string."""
+        assert make_cache_key("en", "de", "") == ""
+
+    def test_make_cache_key_normalized_text(self):
+        """Cache key uses normalized text (case-insensitive)."""
+        key1 = make_cache_key("en", "de", "Hello World")
+        key2 = make_cache_key("en", "de", "hello world")
+        assert key1 == key2
+
+    @pytest.mark.asyncio
+    async def test_cache_not_connected_initially(self):
+        """Cache starts as not connected."""
+        cache = TranslationCache("redis://localhost:6379/0")
+        assert cache.is_connected is False
+
+    @pytest.mark.asyncio
+    async def test_cache_get_returns_none_when_not_connected(self):
+        """Get returns None when not connected."""
+        cache = TranslationCache("redis://localhost:6379/0")
+        result = await cache.get("en", "de", "hello")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cache_set_noop_when_not_connected(self):
+        """Set does nothing when not connected."""
+        cache = TranslationCache("redis://localhost:6379/0")
+        await cache.set("en", "de", "hello", "hallo")
+        assert cache.stats["sets"] == 0
+
+    @pytest.mark.asyncio
+    async def test_cache_stats_initial(self):
+        """Initial stats are all zeros."""
+        cache = TranslationCache("redis://localhost:6379/0")
+        assert cache.stats == {
+            "hits": 0,
+            "misses": 0,
+            "sets": 0,
+            "errors": 0,
+            "bypasses": 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_cache_stats_increments_on_miss(self):
+        """Stats track bypasses (not misses) when not connected."""
+        cache = TranslationCache("redis://localhost:6379/0")
+        await cache.get("en", "de", "hello")
+        assert cache.stats["bypasses"] == 1
+        assert cache.stats["misses"] == 0
+
+    @pytest.mark.asyncio
+    async def test_cache_get_stats_not_connected(self):
+        """Get stats returns not connected status."""
+        cache = TranslationCache("redis://localhost:6379/0")
+        info = await cache.get_stats()
+        assert info["memory"]["status"] == "not connected"
+
+    @pytest.mark.asyncio
+    async def test_cache_close_not_connected(self):
+        """Close when not connected does not raise."""
+        cache = TranslationCache("redis://localhost:6379/0")
+        await cache.close()
+        assert cache.is_connected is False
+
+    @pytest.mark.asyncio
+    async def test_cache_set_empty_text_noop(self):
+        """Setting empty text does not increment sets."""
+        cache = TranslationCache("redis://localhost:6379/0")
+        await cache.set("en", "de", "", "translation")
+        assert cache.stats["sets"] == 0
+
+    def test_make_cache_key_different_custom_instruction(self):
+        """Different custom instructions produce different cache keys."""
+        key1 = make_cache_key("en", "de", "hello", custom_instruction="formal tone")
+        key2 = make_cache_key("en", "de", "hello", custom_instruction="casual tone")
+        assert key1 != key2
+
+    def test_make_cache_key_same_custom_instruction(self):
+        """Same custom instruction produces same cache key."""
+        key1 = make_cache_key("en", "de", "hello", custom_instruction="formal tone")
+        key2 = make_cache_key("en", "de", "hello", custom_instruction="formal tone")
+        assert key1 == key2
+
+    def test_make_cache_key_none_custom_instruction(self):
+        """None custom instruction produces consistent cache key."""
+        key1 = make_cache_key("en", "de", "hello", custom_instruction=None)
+        key2 = make_cache_key("en", "de", "hello", custom_instruction=None)
+        assert key1 == key2
+
+    def test_make_cache_key_instruction_vs_none(self):
+        """Custom instruction vs None produces different cache keys."""
+        key1 = make_cache_key("en", "de", "hello", custom_instruction="formal tone")
+        key2 = make_cache_key("en", "de", "hello", custom_instruction=None)
+        assert key1 != key2
+
+    def test_make_cache_key_different_glossary_terms(self):
+        """Different glossary terms produce different cache keys."""
+        key1 = make_cache_key("en", "de", "hello", glossary_terms=["dinner", "lunch"])
+        key2 = make_cache_key(
+            "en", "de", "hello", glossary_terms=["breakfast", "dinner"]
+        )
+        assert key1 != key2
+
+    def test_make_cache_key_same_glossary_terms(self):
+        """Same glossary terms produce same cache key."""
+        key1 = make_cache_key("en", "de", "hello", glossary_terms=["dinner", "lunch"])
+        key2 = make_cache_key("en", "de", "hello", glossary_terms=["dinner", "lunch"])
+        assert key1 == key2
+
+    def test_make_cache_key_glossary_order_independent(self):
+        """Glossary terms in different order produce same cache key."""
+        key1 = make_cache_key("en", "de", "hello", glossary_terms=["dinner", "lunch"])
+        key2 = make_cache_key("en", "de", "hello", glossary_terms=["lunch", "dinner"])
+        assert key1 == key2
+
+    def test_make_cache_key_none_glossary_terms(self):
+        """None glossary terms produces consistent cache key."""
+        key1 = make_cache_key("en", "de", "hello", glossary_terms=None)
+        key2 = make_cache_key("en", "de", "hello", glossary_terms=None)
+        assert key1 == key2
+
+    def test_make_cache_key_glossary_vs_none(self):
+        """Glossary terms vs None produces different cache keys."""
+        key1 = make_cache_key("en", "de", "hello", glossary_terms=["dinner"])
+        key2 = make_cache_key("en", "de", "hello", glossary_terms=None)
+        assert key1 != key2
+
+    def test_make_cache_key_combined_instruction_and_glossary(self):
+        """Different combinations of instruction and glossary produce different keys."""
+        key1 = make_cache_key(
+            "en", "de", "hello", custom_instruction="formal", glossary_terms=["dinner"]
+        )
+        key2 = make_cache_key(
+            "en", "de", "hello", custom_instruction="casual", glossary_terms=["dinner"]
+        )
+        key3 = make_cache_key(
+            "en", "de", "hello", custom_instruction="formal", glossary_terms=["lunch"]
+        )
+        key4 = make_cache_key(
+            "en", "de", "hello", custom_instruction=None, glossary_terms=None
+        )
+        assert key1 != key2
+        assert key1 != key3
+        assert key1 != key4
+        assert key2 != key3
+
+    def test_make_cache_key_instruction_punctuation_matters(self):
+        """Instructions that differ only in punctuation produce different cache keys."""
+        key1 = make_cache_key(
+            "en", "de", "hello", custom_instruction="Translate formally."
+        )
+        key2 = make_cache_key(
+            "en", "de", "hello", custom_instruction="Translate formally"
+        )
+        assert key1 != key2
+
+    def test_make_cache_key_instruction_preserves_special_chars(self):
+        """Instructions with special characters produce different cache keys."""
+        key1 = make_cache_key(
+            "en",
+            "de",
+            "hello",
+            custom_instruction="Use British English (colour, not color)",
+        )
+        key2 = make_cache_key(
+            "en",
+            "de",
+            "hello",
+            custom_instruction="Use British English colour not color",
+        )
+        assert key1 != key2
+
+    def test_make_cache_key_glossary_pipe_separator_no_collision(self):
+        """Glossary terms containing | don't cause hash collisions."""
+        key1 = make_cache_key("en", "de", "hello", glossary_terms=["a|b", "c"])
+        key2 = make_cache_key("en", "de", "hello", glossary_terms=["a", "b|c"])
+        assert key1 != key2
+
+    def test_make_cache_key_glossary_term_contains_pipe(self):
+        """Glossary terms with | character are hashed correctly."""
+        key1 = make_cache_key("en", "de", "hello", glossary_terms=["a|b"])
+        key2 = make_cache_key("en", "de", "hello", glossary_terms=["a|b"])
+        assert key1 == key2
+        key3 = make_cache_key("en", "de", "hello", glossary_terms=["x|y"])
+        assert key1 != key3
+
+    def test_hash_instruction_none_vs_empty_string(self):
+        """None and empty string instruction produce different cache key parts."""
+        from app.services.translation_cache import _hash_instruction, EMPTY_HASH
+
+        none_hash = _hash_instruction(None)
+        empty_hash = _hash_instruction("")
+        computed_empty = EMPTY_HASH
+
+        assert none_hash == "none"
+        assert empty_hash == computed_empty
+        assert none_hash != empty_hash
+
+    def test_hash_instruction_empty_string_cached(self):
+        """Empty string instruction is cached and returns same hash."""
+        from app.services.translation_cache import _hash_instruction
+
+        _hash_instruction.cache_clear()
+        h1 = _hash_instruction("")
+        h2 = _hash_instruction("")
+        assert h1 == h2
+        info = _hash_instruction.cache_info()
+        assert info.hits == 1
+        assert info.misses == 1
+
+    def test_hash_glossary_none_vs_empty_list(self):
+        """None and empty list glossary produce same cache key part ('none')."""
+        from app.services.translation_cache import _hash_glossary_terms
+
+        none_hash = _hash_glossary_terms(None)
+        empty_list_hash = _hash_glossary_terms([])
+
+        assert none_hash == "none"
+        assert empty_list_hash == "none"
+        assert none_hash == empty_list_hash
+
+    def test_hash_glossary_empty_list_cached(self):
+        """Empty list glossary is cached correctly."""
+        from app.services.translation_cache import _hash_glossary_terms
+
+        h1 = _hash_glossary_terms([])
+        h2 = _hash_glossary_terms([])
+        assert h1 == h2
+
+    def test_cache_key_empty_instruction_vs_none_instruction(self):
+        """Empty string instruction produces different key than None instruction."""
+        key_empty = make_cache_key("en", "de", "hello", custom_instruction="")
+        key_none = make_cache_key("en", "de", "hello", custom_instruction=None)
+        parts_empty = key_empty.split(":")
+        parts_none = key_none.split(":")
+        assert parts_empty[5] == EMPTY_HASH
+        assert parts_none[5] == "none"
+        assert key_empty != key_none
+
+    def test_cache_key_empty_glossary_vs_none_glossary(self):
+        """Empty list and None glossary produce same cache key part."""
+        key_empty = make_cache_key("en", "de", "hello", glossary_terms=[])
+        key_none = make_cache_key("en", "de", "hello", glossary_terms=None)
+        parts_empty = key_empty.split(":")
+        parts_none = key_none.split(":")
+        assert parts_empty[6] == "none"
+        assert parts_none[6] == "none"
+        assert key_empty == key_none
+
+
+class TestTranslationServiceCacheIntegration:
+    """Tests for TranslationService cache integration."""
+
+    @pytest.mark.asyncio
+    async def test_real_translate_cache_hit_bypasses_llm(self, caplog):
+        """Cache hit returns cached result without calling LLM."""
+        service = TranslationService()
+        service._cache_enabled = True
+        service._cache_url = "redis://localhost:6379/0"
+        service._cache_ttl = 86400
+        service._cache_max_entries = 100000
+        service._cache = TranslationCache(
+            "redis://localhost:6379/0",
+            ttl_seconds=86400,
+            max_entries=100000,
+        )
+        source_text = "hello how are you"
+        cached_text = "hallo wie geht es dir"
+        provider = {"api_format": "openai_chat"}
+
+        mock_cache = AsyncMock()
+        mock_cache.is_connected = True
+        mock_cache.get = AsyncMock(return_value={"translated_text": cached_text})
+        mock_cache.set = AsyncMock()
+        service._cache = mock_cache
+
+        with (
+            caplog.at_level(
+                logging.INFO,
+                logger="app.services.translation_service",
+            ),
+            patch.object(
+                service,
+                "_resolve_provider_config",
+                return_value=provider,
+            ),
+        ):
+            result = await service._real_translate(source_text, "en", "de")
+
+        assert result.success is True
+        assert result.text == cached_text
+        mock_cache.get.assert_called_once()
+        mock_cache.set.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_real_translate_cache_miss_calls_llm(self, caplog):
+        """Cache miss calls LLM and stores result."""
+        service = TranslationService()
+        service._cache_enabled = True
+        service._cache_url = "redis://localhost:6379/0"
+        service._cache_ttl = 86400
+        service._cache_max_entries = 100000
+        service._cache = TranslationCache(
+            "redis://localhost:6379/0",
+            ttl_seconds=86400,
+            max_entries=100000,
+        )
+        source_text = "new sentence never seen"
+        translated_text = "neuer satz noch nie gesehen"
+        provider = {"api_format": "openai_chat"}
+
+        mock_cache = AsyncMock()
+        mock_cache.is_connected = True
+        mock_cache.get = AsyncMock(return_value=None)
+        mock_cache.set = AsyncMock()
+        service._cache = mock_cache
+
+        with (
+            caplog.at_level(
+                logging.INFO,
+                logger="app.services.translation_service",
+            ),
+            patch.object(
+                service,
+                "_resolve_provider_config",
+                return_value=provider,
+            ),
+            patch.object(
+                service,
+                "_build_translation_request",
+                return_value=("https://provider.invalid", {}, {}),
+            ),
+            patch.object(
+                service,
+                "_execute_translation_request",
+                new_callable=AsyncMock,
+                return_value=(translated_text, 0.9),
+            ),
+        ):
+            result = await service._real_translate(source_text, "en", "de")
+
+        assert result.success is True
+        assert result.text == translated_text
+        mock_cache.get.assert_called_once()
+        mock_cache.set.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_real_translate_cache_disabled_uses_llm(self, caplog):
+        """When cache is disabled, LLM is called directly."""
+        service = TranslationService()
+        service._cache_enabled = False
+        service._cache = None
+        source_text = "test without cache"
+        translated_text = "test ohne zwischenspeicher"
+        provider = {"api_format": "openai_chat"}
+
+        with (
+            caplog.at_level(
+                logging.INFO,
+                logger="app.services.translation_service",
+            ),
+            patch.object(
+                service,
+                "_resolve_provider_config",
+                return_value=provider,
+            ),
+            patch.object(
+                service,
+                "_build_translation_request",
+                return_value=("https://provider.invalid", {}, {}),
+            ),
+            patch.object(
+                service,
+                "_execute_translation_request",
+                new_callable=AsyncMock,
+                return_value=(translated_text, 0.9),
+            ),
+        ):
+            result = await service._real_translate(source_text, "en", "de")
+
+        assert result.success is True
+        assert result.text == translated_text
+
+    @pytest.mark.asyncio
+    async def test_real_translate_cache_not_connected_uses_llm(self, caplog):
+        """When cache is not connected, LLM is called directly."""
+        service = TranslationService()
+        mock_cache = AsyncMock()
+        mock_cache.is_connected = False
+        service._cache = mock_cache
+        source_text = "test with disconnected cache"
+        translated_text = "test mit getrenntem zwischenspeicher"
+        provider = {"api_format": "openai_chat"}
+
+        with (
+            caplog.at_level(
+                logging.INFO,
+                logger="app.services.translation_service",
+            ),
+            patch.object(
+                service,
+                "_resolve_provider_config",
+                return_value=provider,
+            ),
+            patch.object(
+                service,
+                "_build_translation_request",
+                return_value=("https://provider.invalid", {}, {}),
+            ),
+            patch.object(
+                service,
+                "_execute_translation_request",
+                new_callable=AsyncMock,
+                return_value=(translated_text, 0.9),
+            ),
+        ):
+            result = await service._real_translate(source_text, "en", "de")
+
+        assert result.success is True
+        assert result.text == translated_text
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_returns_quality_score(self):
+        """Cache hit returns quality score from cache."""
+        service = TranslationService()
+        service._cache_enabled = True
+        service._cache_url = "redis://localhost:6379/0"
+        service._cache_ttl = 86400
+        service._cache_max_entries = 100000
+        service._cache = TranslationCache(
+            "redis://localhost:6379/0",
+            ttl_seconds=86400,
+            max_entries=100000,
+        )
+
+        mock_cache = AsyncMock()
+        mock_cache.is_connected = True
+        mock_cache.get = AsyncMock(
+            return_value={
+                "translated_text": "cached translation",
+                "translation_quality": 0.95,
+            }
+        )
+        mock_cache.set = AsyncMock()
+        service._cache = mock_cache
+
+        result = await service._real_translate("test", "en", "de")
+
+        assert result.success is True
+        assert result.translation_quality == 0.95
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_stores_quality_score(self):
+        """Cache miss stores translation with quality score."""
+        service = TranslationService()
+        service._cache_enabled = True
+        service._cache_url = "redis://localhost:6379/0"
+        service._cache_ttl = 86400
+        service._cache_max_entries = 100000
+        service._cache = TranslationCache(
+            "redis://localhost:6379/0",
+            ttl_seconds=86400,
+            max_entries=100000,
+        )
+
+        mock_cache = AsyncMock()
+        mock_cache.is_connected = True
+        mock_cache.get = AsyncMock(return_value=None)
+        mock_cache.set = AsyncMock()
+        service._cache = mock_cache
+
+        provider = {"api_format": "openai_chat"}
+
+        with patch.object(
+            service,
+            "_resolve_provider_config",
+            return_value=provider,
+        ), patch.object(
+            service,
+            "_build_translation_request",
+            return_value=("https://provider.invalid", {}, {}),
+        ), patch.object(
+            service,
+            "_execute_translation_request",
+            new_callable=AsyncMock,
+            return_value=("translated", 0.85),
+        ):
+            result = await service._real_translate("test", "en", "de")
+
+        assert result.success is True
+        assert result.translation_quality == 0.85
+        mock_cache.set.assert_called_once()
+        call_args = mock_cache.set.call_args
+        assert call_args[0][0] == "en"
+        assert call_args[0][1] == "de"
+        assert call_args[0][2] == "test"
+        assert call_args[0][3] == "translated"
+        assert call_args.kwargs["translation_quality"] == 0.85

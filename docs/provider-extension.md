@@ -52,6 +52,9 @@ whisper:
 Expected stream shape:
 
 - The app sends raw `16 kHz`, mono, signed `int16` PCM bytes.
+- Raw PCM contains no sample-rate metadata. Every caller must resample audio to
+  the configured `whisper.sample_rate` / `STT_SAMPLE_RATE` before streaming it;
+  conversation duration and silence bounds are calculated from that contract.
 - The app may first send a JSON language hint: `{"language": "de"}`.
 - The STT provider returns JSON messages with `text`, optional `language`,
   optional `is_final`, optional `metrics`, and optional `error`.
@@ -191,3 +194,32 @@ Before wiring a provider into a live deployment:
 
 For open-source deployments, prefer compatibility adapters around existing
 provider protocols before adding new pipeline behavior.
+
+## Built-in specialized speech providers
+
+The specialized providers keep the public PolyTalk contracts unchanged. Build
+and start the standard Compose stack with:
+
+    HF_TOKEN=hf_read_token_after_accepting_both_gated_model_terms
+    docker compose build --progress=plain
+    docker compose up -d --no-build
+
+Explicit source languages route through the configured STT provider list.
+Conversation sessions resolve both selected languages per utterance. A provider
+that independently detects both languages runs once; otherwise the application
+calls both language/provider hypotheses concurrently and emits only the
+adjudicated winner. faster-whisper is eligible only for conversation languages
+listed in `whisper.conversation.fallback_languages`. Explicit-language streams
+retain the buffered replay fallback when a specialized backend fails before it
+emits text.
+
+Indian target languages route to the Indic Parler adapter, whose binary WAV
+response is normalized to the same media URL contract used by Piper and
+Supertonic. Punjabi support is unofficial and should be treated as
+experimental. Provider errors fall back to Piper.
+
+The specialized STT and Indic Parler images download their configured models
+during build. The Indic Parler image clones and fast-forward-pulls the inference
+repository, then downloads the gated model and its description tokenizer using
+a BuildKit secret. The token is not stored in the image. No host source or model
+path is mounted into these containers. Runtime model access is offline.
