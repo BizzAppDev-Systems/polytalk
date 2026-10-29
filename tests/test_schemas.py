@@ -5,7 +5,11 @@
 Tests for Pydantic schemas.
 """
 
-from app.schemas.translation import HealthResponse, ErrorResponse
+from app.schemas.translation import (
+    ErrorResponse,
+    HealthResponse,
+    TextTranslationRequest,
+)
 from app.version import __version__
 
 
@@ -110,3 +114,43 @@ class TestErrorResponse:
         response = ErrorResponse(error="")
         assert response.error == ""
         assert response.success is False
+
+
+class TestTextTranslationRequestGlossaryTerms:
+    """glossary_terms normalizes blanks and enforces the count bound."""
+
+    def test_glossary_terms_trimmed(self):
+        req = TextTranslationRequest(
+            text="hello",
+            source_language="en",
+            target_language="de",
+            glossary_terms=["  transformer  ", "attention"],
+        )
+        assert req.glossary_terms == ["transformer", "attention"]
+
+    def test_glossary_terms_blank_only_normalizes_to_none(self):
+        req = TextTranslationRequest(
+            text="hello",
+            source_language="en",
+            target_language="de",
+            glossary_terms=["", "   "],
+        )
+        assert req.glossary_terms is None
+
+    def test_glossary_terms_omitted_defaults_to_none(self):
+        req = TextTranslationRequest(
+            text="hello", source_language="en", target_language="de"
+        )
+        assert req.glossary_terms is None
+
+    def test_glossary_terms_over_500_rejected(self):
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            TextTranslationRequest(
+                text="hello",
+                source_language="en",
+                target_language="de",
+                glossary_terms=[f"term{i}" for i in range(501)],
+            )

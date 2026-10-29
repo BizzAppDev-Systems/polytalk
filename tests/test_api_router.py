@@ -249,6 +249,7 @@ class TestAPIRouter:
             custom_instruction="",
             custom_translation_routing=False,
             preserve_source_structure=True,
+            glossary_terms=None,
         )
 
     def test_translate_text_rejects_whitespace_only_input(self, client):

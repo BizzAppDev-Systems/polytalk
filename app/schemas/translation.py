@@ -5,7 +5,7 @@
 Pydantic schemas for request/response validation.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 
 from ..version import __version__
@@ -46,6 +46,24 @@ class TextTranslationRequest(BaseModel):
     source_language: str = Field(pattern=r"^[a-z]{2,3}(?:_[A-Z]{2})?$")
     target_language: str = Field(pattern=r"^[a-z]{2,3}(?:_[A-Z]{2})?$")
     custom_instruction: Optional[str] = Field(default=None, max_length=1000)
+    glossary_terms: Optional[list[str]] = Field(default=None, max_length=500)
+
+    @field_validator("glossary_terms")
+    @classmethod
+    def normalize_glossary_terms(
+        cls, value: Optional[list[str]]
+    ) -> Optional[list[str]]:
+        """Trim glossary terms and drop blank entries.
+
+        Pydantic already rejects non-string items and enforces the term-count
+        bound; the service layer applies the prompt-safety sanitizer to each
+        surviving term. An all-blank list normalises to ``None`` so it never
+        adds an empty glossary block to the prompt.
+        """
+        if value is None:
+            return None
+        normalized = [term.strip() for term in value if term.strip()]
+        return normalized or None
 
 
 class TextTranslationResponse(BaseModel):

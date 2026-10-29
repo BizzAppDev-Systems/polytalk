@@ -227,6 +227,7 @@ async def translate_text(
         custom_instruction=sanitize_custom_instruction(request.custom_instruction),
         custom_translation_routing=(translation_routing or "").lower() == "custom",
         preserve_source_structure=True,
+        glossary_terms=request.glossary_terms,
     )
     if not result.success or not result.text.strip():
         logger.warning(

@@ -9,6 +9,7 @@ PolyTalk CE uses app versions such as `0.4.0` and Git tags such as `v0.4.0-ce`.
 - Added text translation, text-to-speech, and voice catalog HTTP endpoints (`/api/v1/text/translations`, `/api/v1/text/speech`, `/api/v1/text/voices`).
 - Added Redis-backed translation cache with TTL-bounded growth and privacy-safe logging (no transcript content in cache logs).
 - Added configurable translation pacing (`translation_buffer_seconds`) controls for the streaming pipeline.
+- Added optional company glossary terms to the text-translation endpoint request.
 - Renamed the local Redis service to `polytalk-cache-redis` and restricted its published port to localhost.
 
 ## 0.4.0 - 2026-07-06
@@ -23,6 +24,7 @@ PolyTalk CE uses app versions such as `0.4.0` and Git tags such as `v0.4.0-ce`.
 - Added `CUSTOM_INSTRUCTION_MAX_CHARS` and translation provider routing examples to environment/config examples.
 - Added tests for UI localization completeness, custom instructions, conversation mode, provider routing, and updated frontend behavior.
 
+- Added optional company glossary terms to the text-translation endpoint request.
 
 ## 0.3.0 - 2026-06-13
 
