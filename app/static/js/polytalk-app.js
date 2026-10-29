@@ -31,6 +31,12 @@ class PolyTalkApp {
         this.ws = null;
         this.isStreaming = false;
         this.isPaused = false;
+        this._statusDebounceMs = 500;
+        this._lastStatusTime = 0;
+        this._statusDebounceTimer = null;
+        this._currentStatusMessage = '';
+        this._connectionLostFlashShown = false;
+        this._offlineStatusShown = false;
         this.currentTranscript = '';
         this.currentTranslation = '';
         this.liveTranscriptText = '';
@@ -144,6 +150,291 @@ class PolyTalkApp {
         }
         if (this.sessionControls) this.sessionControls.style.display = 'none';
         if (this.sessionRuntimeToggles) this.sessionRuntimeToggles.setAttribute('hidden', '');
+
+        // Use existing #status element for connection recovery messages
+        this.connectionStatusElement = this.status;
+    }
+
+    _showConnectionStatus(message, type = 'info') {
+        if (!this.connectionStatusElement) {
+            return;
+        }
+
+        // Debounce status updates to prevent rapid blinking/flash during unstable network
+        const now = Date.now();
+        if (now - this._lastStatusTime < this._statusDebounceMs) {
+            return;
+        }
+        if (this._statusDebounceTimer) {
+            clearTimeout(this._statusDebounceTimer);
+        }
+        this._statusDebounceTimer = setTimeout(() => {
+            this._lastStatusTime = Date.now();
+            this._updateStatusDisplay(message, type);
+        }, 50);
+    }
+
+    _updateStatusDisplay(message, type) {
+        if (!this.connectionStatusElement) {
+            return;
+        }
+
+        // Prevent duplicate display of same message to avoid flickering
+        const displayKey = `${type}:${message}`;
+        if (this._currentStatusMessage === displayKey) {
+            return;
+        }
+        this._currentStatusMessage = displayKey;
+
+        this.connectionStatusElement.textContent = message;
+        this.connectionStatusElement.style.display = 'block';
+        this.connectionStatusElement.className = `status visible ${type}`;
+    }
+
+    _hideConnectionStatus() {
+        if (!this.connectionStatusElement) {
+            return;
+        }
+        this.connectionStatusElement.style.display = 'none';
+        this.connectionStatusElement.className = 'status';
+        this._currentStatusMessage = '';
+        if (this._statusDebounceTimer) {
+            clearTimeout(this._statusDebounceTimer);
+            this._statusDebounceTimer = null;
+        }
+    }
+
+    _clearReconnectTimer() {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+    }
+
+    _cleanupConnectionState() {
+        this._clearReconnectTimer();
+        this.wsConnectionState = 'connected';
+        this._hideConnectionStatus();
+    }
+
+    _handleBrowserOffline() {
+        console.info('[ConnectionRecovery] Browser went offline');
+        this.isOnline = false;
+        this.wsConnectionState = 'reconnecting';
+        this._clearReconnectTimer();
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.close(1000, 'Browser offline');
+        }
+        this._showConnectionStatus(this.uiText('No internet connection. Trying to reconnect...'), 'warning');
+        this._offlineStatusShown = true;
+    }
+
+    _handleBrowserOnline() {
+        console.info('[ConnectionRecovery] Browser came back online');
+        this.isOnline = true;
+        if (this.wsConnectionState === 'reconnecting') {
+            this._scheduleReconnect();
+        }
+    }
+
+    _scheduleReconnect() {
+        this._clearReconnectTimer();
+        if (this.audioRecorder.isRecording && !this.audioRecorder.isPaused) {
+            this.audioRecorder.pause();
+        }
+        if (this.reconnectAttempts >= this._reconnectMaxAttempts) {
+            this._clearReconnectTimer();
+            this.reconnectAttempts = 0;
+            this.isStreaming = false;
+            this.isPaused = false;
+            this._showConnectionStatus(this.uiText('Unable to reconnect. Please try again.'), 'error');
+            this.resetTTSPlayback();
+            this.resetReadinessPanel();
+            this.updateUIState('ready');
+            this.audioRecorder.stop();
+            return;
+        }
+        const delay = this._reconnectBackoffMs[this.reconnectAttempts] || this._reconnectBackoffMs[this._reconnectBackoffMs.length - 1];
+        this.reconnectAttempts++;
+        this.wsConnectionState = 'reconnecting';
+        console.info(`[ConnectionRecovery] Scheduling reconnect in ${delay}ms (attempt ${this.reconnectAttempts}/${this._reconnectMaxAttempts})`);
+        this.reconnectTimer = setTimeout(() => {
+            this._reconnectWebSocket();
+        }, delay);
+    }
+
+    _reconnectWebSocket() {
+        if (this.wsConnectionState === 'connected') {
+            return;
+        }
+        if (!this.isOnline) {
+            console.info('[ConnectionRecovery] Not reconnecting: browser is offline');
+            this._scheduleReconnect();
+            return;
+        }
+        if (!this._lastSavedLang || !this._lastSavedMode) {
+            console.warn('[ConnectionRecovery] Cannot reconnect: missing saved language params');
+            this._clearReconnectTimer();
+            this.wsConnectionState = 'failed';
+            this._showConnectionStatus(this.uiText('Unable to reconnect. Please try again.'), 'error');
+            this.resetTTSPlayback();
+            this.resetReadinessPanel();
+            this.updateUIState('ready');
+            this.audioRecorder.stop();
+            return;
+        }
+
+        const sourceLang = this._lastSavedLang.sourceLang || this.sourceLang?.value;
+        const targetLang = this._lastSavedLang.targetLang || this.targetLang?.value;
+        const mode = this._lastSavedMode;
+
+        console.info(`[ConnectionRecovery] Attempting reconnect: ${sourceLang} -> ${targetLang} (${mode})`);
+        this._showConnectionStatus(this.uiText('Reconnecting...'), 'info');
+        try {
+            this.resetTTSPlayback();
+            if (this.ws) {
+                this.ws.close(1000, 'Reconnecting');
+            }
+            this.ws = this._reestablishConnection(sourceLang, targetLang, mode);
+
+            if (this.audioRecorder.isRecording) {
+                this.audioRecorder.rebindProcessor((chunk, level = 0) => {
+                    this._sendAudioChunk(chunk, level);
+                });
+
+                const recorderWasPaused = this.audioRecorder.isPaused;
+                if (recorderWasPaused !== this.isPaused) {
+                    if (this.isPaused) {
+                        this.audioRecorder.pause();
+                        console.info('[ConnectionRecovery] Synced audioRecorder to paused state');
+                    } else {
+                        this.audioRecorder.resume((chunk, level = 0) => {
+                            this._sendAudioChunk(chunk, level);
+                        });
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('[ConnectionRecovery] Reconnect failed:', error);
+            this._scheduleReconnect();
+        }
+    }
+
+    _sendAudioChunk(chunk, level = 0) {
+        if (this.wsConnectionState !== 'connected') {
+            return;
+        }
+        if (this.isPaused) {
+            return;
+        }
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(chunk);
+        }
+    }
+
+    _reestablishConnection(sourceLang, targetLang, mode) {
+        const wsUrl = this.buildTranslationWebSocketUrl(sourceLang, targetLang, mode);
+        this._lastSavedLang = { sourceLang, targetLang };
+        this._lastSavedMode = mode;
+        const ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+            this.wsConnectionState = 'connected';
+            this._offlineStatusShown = false;
+            if (this.reconnectAttempts > 0) {
+                console.info('[ConnectionRecovery] WebSocket reconnected during reconnect attempt, waiting for actual translation data');
+            } else {
+                this.flashReadiness(this.uiText('Reconnected'), 'done', true);
+                this.updateReadinessStage('server_connected', 'done', this.uiText('Server connected'));
+            }
+        };
+
+        ws.onmessage = (event) => {
+            if (event.currentTarget !== this.ws) {
+                console.info('[ConnectionRecovery] Ignoring message from stale connection');
+                return;
+            }
+            const result = JSON.parse(event.data);
+            console.log('[ConnectionRecovery] onmessage event:', JSON.stringify(result));
+            console.log('[ConnectionRecovery] isStreaming before:', this.isStreaming);
+            console.log('[ConnectionRecovery] wsConnectionState before:', this.wsConnectionState);
+            this.handleStreamResult(result);
+        };
+
+        ws.onclose = (event) => {
+            if (event.currentTarget !== this.ws) {
+                console.info(`[ConnectionRecovery] Ignoring close from stale connection (code: ${event.code})`);
+                return;
+            }
+            if (this.wsConnectionState === 'reconnecting') {
+                if (event.code === 1000) {
+                    if (!this.isOnline) {
+                        console.info(`[ConnectionRecovery] Normal close during reconnect but browser is offline, keeping reconnect state`);
+                        return;
+                    }
+                    console.info(`[ConnectionRecovery] Close during reconnect (code: ${event.code}), reconnect already scheduled`);
+                    return;
+                }
+                if (this.reconnectAttempts >= this._reconnectMaxAttempts) {
+                    this._clearReconnectTimer();
+                    this.reconnectAttempts = 0;
+                    this.isStreaming = false;
+                    this.isPaused = false;
+                    this._showConnectionStatus(this.uiText('Unable to reconnect. Please try again.'), 'error');
+                    this.flashReadiness(this.uiText('Unable to reconnect. Please try again.'), 'error', false);
+                    this.resetTTSPlayback();
+                    this.updateUIState('ready');
+                    this.audioRecorder.stop();
+                    return;
+                }
+                this.readinessStages['reconnecting'] = 'active';
+                if (this.readinessPanel) {
+                    this.readinessPanel.classList.remove('active', 'done', 'warning', 'error');
+                    this.readinessPanel.classList.add('active');
+                }
+                if (this.readinessSummary) {
+                    this.readinessSummary.textContent = this.uiText('Reconnecting...');
+                }
+                console.info(`[ConnectionRecovery] Abnormal close during reconnect (code: ${event.code}), scheduling next attempt`);
+                this._scheduleReconnect();
+                return;
+            }
+            if (event.code === 1000) {
+                if (this.isStreaming) {
+                    if (this.wsConnectionState !== 'reconnecting' && !this._offlineStatusShown) {
+                        this._showConnectionStatus(this.uiText('Connection to the translation service was lost. Trying to reconnect...'), 'warning');
+                        this.flashReadiness(this.uiText('Connection lost'), 'warning', false);
+                    }
+                    this.wsConnectionState = 'reconnecting';
+                    this._scheduleReconnect();
+                } else {
+                    console.info(`[ConnectionRecovery] Normal close (code: ${event.code}), no reconnect needed`);
+                    this.reconnectAttempts = 0;
+                    this.isStreaming = false;
+                    this.isPaused = false;
+                    this.wsConnectionState = 'connected';
+                    this._cleanupConnectionState();
+                    this.updateUIState('ready');
+                }
+                return;
+            }
+            if (this.isStreaming) {
+                if (this.wsConnectionState !== 'reconnecting' && !this._offlineStatusShown) {
+                    this._showConnectionStatus(this.uiText('Connection to the translation service was lost. Trying to reconnect...'), 'warning');
+                    this.flashReadiness(this.uiText('Connection lost'), 'warning', false);
+                }
+                console.info(`[ConnectionRecovery] Abnormal disconnect (code: ${event.code}), scheduling reconnect`);
+                this.wsConnectionState = 'reconnecting';
+                this._scheduleReconnect();
+            } else {
+                console.info(`[ConnectionRecovery] Abnormal disconnect after session end (code: ${event.code}), no reconnect needed`);
+                this.reconnectAttempts = 0;
+                this.wsConnectionState = 'connected';
+                this.updateUIState('ready');
+            }
+        };
+
+        return ws;
     }
 
     /**
@@ -1276,6 +1567,46 @@ class PolyTalkApp {
 
             case 'error':
                 this.showSessionNotice(this.t('js.error_message', { error: result.error }), 'error');
+                if (result.error_code === 'connection_lost') {
+                    this.wsConnectionState = 'reconnecting';
+                    if (this.isOnline && !this._offlineStatusShown) {
+                        this._showConnectionStatus(
+                            this.uiText('Connection to the translation service was lost. Trying to reconnect...'),
+                            'warning'
+                        );
+                        if (!this._connectionLostFlashShown) {
+                            this._connectionLostFlashShown = true;
+                            this.flashReadiness(this.uiText('Connection lost'), 'warning', false);
+                        }
+                    }
+                    this._scheduleReconnect();
+                    return;
+                }
+                if (result.error_code === 'transcription_error') {
+                    this._showConnectionStatus(this.t('js.error_stt', { error: result.error }), 'warning');
+                    if (this.audioRecorder.isRecording && !this.audioRecorder.isPaused) {
+                        this.audioRecorder.pause();
+                    }
+                    this.isStreaming = false;
+                    this.updateUIState('ready');
+                    return;
+                }
+                if (result.error_code === 'translation_error') {
+                    this._showConnectionStatus(this.t('js.error_translation', { error: result.error }), 'warning');
+                    if (this.audioRecorder.isRecording && !this.audioRecorder.isPaused) {
+                        this.audioRecorder.pause();
+                    }
+                    this.isStreaming = false;
+                    this.updateUIState('ready');
+                    return;
+                }
+                if (result.error_code === 'tts_error') {
+                    this._showConnectionStatus(this.t('js.error_tts', { error: result.error }), 'warning');
+                    this.isStreaming = false;
+                    this.updateUIState('ready');
+                    return;
+                }
+                this._showConnectionStatus(this.t('js.error_message', { error: result.error }), 'error');
                 this.closeWebSocket();
                 break;
         }
