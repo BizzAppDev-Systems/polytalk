@@ -168,12 +168,6 @@
 
     sourceLanguage.addEventListener('change', syncLanguages);
     targetLanguage.addEventListener('change', syncLanguages);
-    document.getElementById('swap-langs-btn')?.addEventListener('click', () => {
-        const previousSource = sourceLanguage.value;
-        sourceLanguage.value = targetLanguage.value;
-        targetLanguage.value = previousSource;
-        syncLanguages();
-    });
 
     translateButton.addEventListener('click', async () => {
         const currentSourceText = input.value.trim();
