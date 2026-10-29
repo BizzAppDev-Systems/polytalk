@@ -23,6 +23,12 @@ function pipelineModeRank(value) {
 
 class PolyTalkApp {
     /**
+     * ISO language codes for right-to-left (RTL) languages supported in the app.
+     * Keep in sync with source/target language dropdowns in index.html.
+     */
+    static RTL_LANG_CODES = ['ar', 'he', 'fa', 'ur', 'ps', 'sd', 'yi'];
+
+    /**
      * Main application class for PolyTalk
      */
     constructor() {
@@ -73,6 +79,33 @@ class PolyTalkApp {
      */
     uiText(value, params = {}) {
         return window.PolyTalkI18n?.text(value, params) || String(value ?? '');
+    }
+
+    /**
+     * Check if a language code is a right-to-left (RTL) language.
+     * Only checks languages currently present in the source/target dropdowns.
+     * @param {string} code - Language code to check
+     * @returns {boolean} - Whether the language is RTL
+     */
+    isRtlLanguage(code) {
+        if (!code) return false;
+        return PolyTalkApp.RTL_LANG_CODES.includes(code.toLowerCase());
+    }
+
+    /**
+     * Apply RTL direction styling to a text container element.
+     * @param {HTMLElement} element - The element to apply RTL to
+     * @param {boolean} isRtl - Whether to apply RTL direction
+     */
+    applyRtlDirection(element, isRtl) {
+        if (!element) return;
+        if (isRtl) {
+            element.setAttribute('dir', 'rtl');
+            element.style.textAlign = 'right';
+        } else {
+            element.removeAttribute('dir');
+            element.style.textAlign = '';
+        }
     }
 
     /**
@@ -1402,19 +1435,17 @@ class PolyTalkApp {
         const direction = `${source} -> ${target}`;
         const transcript = this.escapeHtml(result.transcript || '');
         const translation = this.escapeHtml(result.translated_text || '');
+        const isSourceRtl = this.isRtlLanguage(result.source_language);
+        const isTargetRtl = this.isRtlLanguage(result.target_language);
         if (this.liveTranscript) {
             this.liveTranscript.querySelector('.placeholder')?.remove();
-            this.liveTranscript.insertAdjacentHTML(
-                'beforeend',
-                `<div class="conversation-turn"><strong>${this.escapeHtml(direction)}</strong><p>${transcript}</p></div>`
-            );
+            const turnHtml = `<div class="conversation-turn"><strong>${this.escapeHtml(direction)}</strong><p${isSourceRtl ? ' dir="rtl" style="text-align: right"' : ''}>${transcript}</p></div>`;
+            this.liveTranscript.insertAdjacentHTML('beforeend', turnHtml);
         }
         if (this.liveTranslation) {
             this.liveTranslation.querySelector('.placeholder')?.remove();
-            this.liveTranslation.insertAdjacentHTML(
-                'beforeend',
-                `<div class="conversation-turn"><strong>${this.escapeHtml(direction)}</strong><p>${translation}</p></div>`
-            );
+            const turnHtml = `<div class="conversation-turn"><strong>${this.escapeHtml(direction)}</strong><p${isTargetRtl ? ' dir="rtl" style="text-align: right"' : ''}>${translation}</p></div>`;
+            this.liveTranslation.insertAdjacentHTML('beforeend', turnHtml);
         }
     }
 
@@ -1423,6 +1454,8 @@ class PolyTalkApp {
      */
     updateLiveTranscript(text, isPartial) {
         if (this.liveTranscript) {
+            const sourceLang = this.sourceLang?.value;
+            const isRtl = this.isRtlLanguage(sourceLang);
             // Clean up multiple spaces
             const cleanText = text.replace(/\s+/g, ' ');
             this.currentTranscript = cleanText;
@@ -1441,9 +1474,25 @@ class PolyTalkApp {
                 }
                 textElement.textContent = cleanText + (isPartial ? '...' : '');
                 textElement.style.fontStyle = isPartial ? 'italic' : 'normal';
+                if (isRtl) {
+                    textElement.setAttribute('dir', 'rtl');
+                    textElement.style.textAlign = 'right';
+                } else {
+                    textElement.removeAttribute('dir');
+                    textElement.style.textAlign = '';
+                }
             } else {
-                this.liveTranscript.innerHTML = this.escapeHtml(cleanText) + (isPartial ? '...' : '');
-                this.liveTranscript.style.fontStyle = isPartial ? 'italic' : 'normal';
+                const suffix = isPartial ? '...' : '';
+                const textDiv = document.createElement('div');
+                textDiv.className = 'live-transcript-text';
+                textDiv.textContent = cleanText + suffix;
+                textDiv.style.fontStyle = isPartial ? 'italic' : 'normal';
+                if (isRtl) {
+                    textDiv.setAttribute('dir', 'rtl');
+                    textDiv.style.textAlign = 'right';
+                }
+                this.liveTranscript.innerHTML = '';
+                this.liveTranscript.appendChild(textDiv);
             }
         }
     }
@@ -1453,6 +1502,8 @@ class PolyTalkApp {
      */
     updateLiveTranslation(text) {
         if (this.liveTranslation) {
+            const targetLang = this.targetLang?.value;
+            const isRtl = this.isRtlLanguage(targetLang);
             // Preserve separator elements if they exist
             const separators = this.liveTranslation.querySelectorAll('.language-swap-separator');
             const hasSeparators = separators.length > 0;
@@ -1466,8 +1517,23 @@ class PolyTalkApp {
                     this.liveTranslation.insertBefore(textElement, separators[0]);
                 }
                 textElement.textContent = text;
+                if (isRtl) {
+                    textElement.setAttribute('dir', 'rtl');
+                    textElement.style.textAlign = 'right';
+                } else {
+                    textElement.removeAttribute('dir');
+                    textElement.style.textAlign = '';
+                }
             } else {
-                this.liveTranslation.innerHTML = this.escapeHtml(text);
+                const textDiv = document.createElement('div');
+                textDiv.className = 'live-translation-text';
+                textDiv.textContent = text;
+                if (isRtl) {
+                    textDiv.setAttribute('dir', 'rtl');
+                    textDiv.style.textAlign = 'right';
+                }
+                this.liveTranslation.innerHTML = '';
+                this.liveTranslation.appendChild(textDiv);
             }
         }
     }
@@ -1485,6 +1551,8 @@ class PolyTalkApp {
             if (textElement) {
                 textElement.textContent = '';
                 textElement.style.fontStyle = 'normal';
+                textElement.style.textAlign = '';
+                textElement.removeAttribute('dir');
             }
         }
         if (this.liveTranslation) {
@@ -1492,6 +1560,8 @@ class PolyTalkApp {
             const textElement = this.liveTranslation.querySelector('.live-translation-text');
             if (textElement) {
                 textElement.textContent = '';
+                textElement.style.textAlign = '';
+                textElement.removeAttribute('dir');
             }
         }
     }
@@ -1705,10 +1775,12 @@ class PolyTalkApp {
     displayResult(result) {
         if (result.transcript) {
             this.transcript.innerHTML = this.escapeHtml(result.transcript);
+            this.applyRtlDirection(this.transcript, this.isRtlLanguage(this.sourceLang?.value));
         }
 
         if (result.translated_text) {
             this.translation.innerHTML = this.escapeHtml(result.translated_text);
+            this.applyRtlDirection(this.translation, this.isRtlLanguage(this.targetLang?.value));
         }
 
         if (result.audio_url) {
