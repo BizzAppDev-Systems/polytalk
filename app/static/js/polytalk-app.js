@@ -900,9 +900,7 @@ class PolyTalkApp {
         }
 
         this.sourceLang.value = targetValue;
-        this.sourceLang.dispatchEvent(new Event('change'));
         this.targetLang.value = sourceValue;
-        this.targetLang.dispatchEvent(new Event('change'));
         this.updateLanguageParamsInUrl();
         this.showStatus(this.uiText('Languages swapped!'), 'info');
     }
