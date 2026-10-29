@@ -10,16 +10,28 @@ Provides REST endpoints for audio translation.
 import asyncio
 import json
 import time
-from typing import Optional, AsyncGenerator
+from collections.abc import AsyncGenerator
+from pathlib import Path
+from typing import Optional
 
 from fastapi import (
     APIRouter,
+    Header,
+    HTTPException,
+    Response,
     WebSocket,
     WebSocketDisconnect,
+    status,
 )
 
 from ..services.pipeline_service import TranslationPipelineService
 from ..services.visual_context_service import VisualContextService
+from ..schemas.translation import (
+    TextSpeechRequest,
+    TextTranslationRequest,
+    TextTranslationResponse,
+)
+from ..utils.audio import estimate_audio_duration
 from ..utils.config import get_custom_instruction_max_chars
 from ..utils.logger import get_logger
 from ..utils.sanitize import normalize_instruction
@@ -74,6 +86,127 @@ def should_start_visual_context_request(
 ) -> bool:
     """Return whether a visual context request should be accepted."""
     return bool(image_data_url) and not (in_flight or ready)
+
+
+def _normalized_text(value: str) -> str:
+    """Trim outer whitespace while preserving the user's Unicode content."""
+    text = value.strip()
+    if not text:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Text must not be empty",
+        )
+    return text
+
+
+def _audio_media_type(audio_path: Path) -> str:
+    """Infer the response media type from a generated audio artifact."""
+    media_types = {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/ogg",
+        ".flac": "audio/flac",
+        ".webm": "audio/webm",
+        ".aac": "audio/aac",
+        ".m4a": "audio/mp4",
+    }
+    return media_types.get(audio_path.suffix.lower(), "application/octet-stream")
+
+
+@router.post("/text/translations", response_model=TextTranslationResponse)
+async def translate_text(
+    request: TextTranslationRequest,
+    translation_routing: str | None = Header(
+        default=None, alias="X-PolyTalk-Translation-Routing"
+    ),
+) -> TextTranslationResponse:
+    """Translate user-provided text without requiring an audio stream."""
+    pipeline = get_pipeline_service()
+    result = await pipeline.translation.translate(
+        _normalized_text(request.text),
+        request.source_language,
+        request.target_language,
+        custom_instruction=sanitize_custom_instruction(request.custom_instruction),
+        custom_translation_routing=(translation_routing or "").lower() == "custom",
+        preserve_source_structure=True,
+    )
+    if not result.success or not result.text.strip():
+        logger.warning(
+            "Text translation failed: source=%s target=%s",
+            request.source_language,
+            request.target_language,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Translation is currently unavailable",
+        )
+    return TextTranslationResponse(
+        translated_text=result.text,
+        source_language=result.source_language or request.source_language,
+        target_language=result.target_language or request.target_language,
+    )
+
+
+@router.get("/text/voices")
+async def text_voices(language: str) -> dict:
+    """List voices actually installed for the requested language."""
+    if not language or len(language) > 12:
+        raise HTTPException(422, "Invalid language")
+    return {"voices": await get_pipeline_service().tts.available_text_voices(language)}
+
+
+@router.post("/text/speech")
+async def synthesize_text(request: TextSpeechRequest) -> Response:
+    """Generate playable speech bytes for translated text."""
+    pipeline = get_pipeline_service()
+    if request.voice:
+        result = await pipeline.tts.synthesize_selected_voice(
+            _normalized_text(request.text), request.language, request.voice
+        )
+    else:
+        result = await pipeline.tts.synthesize(
+            _normalized_text(request.text), request.language
+        )
+    if not result.success or result.audio_path is None:
+        logger.warning("Text speech generation failed: language=%s", request.language)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Speech generation is currently unavailable",
+        )
+
+    audio_path = result.audio_path
+    try:
+        audio_content = audio_path.read_bytes()
+        if not audio_content:
+            raise OSError("Generated speech file is empty")
+    except OSError as exc:
+        logger.warning(
+            "Generated speech could not be read: language=%s", request.language
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Generated speech is unavailable",
+        ) from exc
+    finally:
+        try:
+            audio_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Temporary text speech file cleanup failed", exc_info=True)
+
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Audio-Duration-Seconds": str(
+            result.duration
+            if result.duration is not None
+            else estimate_audio_duration(audio_content)
+        ),
+    }
+    return Response(
+        content=audio_content,
+        media_type=_audio_media_type(audio_path),
+        headers=headers,
+    )
 
 
 @router.get("/health")

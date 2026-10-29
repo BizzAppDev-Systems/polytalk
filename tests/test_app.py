@@ -579,37 +579,36 @@ class TestServices:
         service = TranslationService()
 
         service.api_format = "openai_chat"
-        assert (
-            service._parse_translation_response(
-                {
-                    "choices": [{"message": {"content": "નમસ્તે"}}],
-                }
-            )
-            == "નમસ્તે"
+        text, quality = service._parse_translation_response(
+            {
+                "choices": [{"message": {"content": "નમસ્તે"}}],
+            }
         )
+        assert text == "નમસ્તે"
+        assert quality == 0.5
 
         service.api_format = "openai_responses"
-        assert service._parse_translation_response({"output_text": "નમસ્તે"}) == "નમસ્તે"
+        text, quality = service._parse_translation_response({"output_text": "નમસ્તે"})
+        assert text == "નમસ્તે"
+        assert quality == 0.5
 
         service.api_format = "anthropic_messages"
-        assert (
-            service._parse_translation_response(
-                {
-                    "content": [{"type": "text", "text": "નમસ્તે"}],
-                }
-            )
-            == "નમસ્તે"
+        text, quality = service._parse_translation_response(
+            {
+                "content": [{"type": "text", "text": "નમસ્તે"}],
+            }
         )
+        assert text == "નમસ્તે"
+        assert quality == 0.5
 
         service.api_format = "gemini_generate_content"
-        assert (
-            service._parse_translation_response(
-                {
-                    "candidates": [{"content": {"parts": [{"text": "નમસ્તે"}]}}],
-                }
-            )
-            == "નમસ્તે"
+        text, quality = service._parse_translation_response(
+            {
+                "candidates": [{"content": {"parts": [{"text": "નમસ્તે"}]}}],
+            }
         )
+        assert text == "નમસ્તે"
+        assert quality == 0.5
 
     def test_translation_allows_openai_responses_without_api_key(self):
         """Test OpenAI-compatible responses can run without auth."""
@@ -640,17 +639,21 @@ class TestServices:
         assert "Authorization" not in headers
 
     def test_translation_parses_empty_gemini_edge_cases_as_empty_text(self):
-        """Test Gemini edge cases produce empty text for caller validation."""
+        """Test Gemini edge cases raise ValueError for empty responses."""
         from app.services.translation_service import TranslationService
 
         service = TranslationService()
         service.api_format = "gemini_generate_content"
 
-        assert service._parse_translation_response({"candidates": []}) == ""
-        assert service._parse_translation_response({"candidates": [{}]}) == ""
-        assert (
-            service._parse_translation_response({"candidates": [{"content": {}}]}) == ""
-        )
+        for payload in [
+            {"candidates": []},
+            {"candidates": [{}]},
+            {"candidates": [{"content": {}}]},
+        ]:
+            with pytest.raises(
+                ValueError, match="Empty gemini_generate_content translation response"
+            ):
+                service._parse_translation_response(payload)
 
     def test_translation_rejects_unknown_api_format(self):
         """Test unsupported API formats fail before making a request."""
