@@ -66,3 +66,16 @@ class TestWebRouter:
         assert "buildTranslationWebSocketUrl" in script
         assert "new URLSearchParams" in script
         assert "params.set('custom_instruction', customInstruction)" in script
+
+    def test_frontend_buffers_audio_until_translation_socket_opens(self):
+        """Startup PCM is retained and flushed instead of being silently dropped."""
+        script = (
+            Path(__file__).resolve().parents[1] / "app/static/js/polytalk-app.js"
+        ).read_text()
+
+        assert "beginStartupAudioBuffering()" in script
+        assert "sendOrBufferAudioChunk(chunk)" in script
+        assert "flushStartupAudioBuffer()" in script
+        assert "this.maxStartupAudioBufferBytes = 16000 * 2 * 5" in script
+        assert script.count("this.sendOrBufferAudioChunk(chunk);") == 2
+        assert script.count("this.flushStartupAudioBuffer();") >= 2

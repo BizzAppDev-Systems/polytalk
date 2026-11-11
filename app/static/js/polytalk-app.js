@@ -30,6 +30,12 @@ class PolyTalkApp {
         this.isTabAudioSupported = true;
         this.isApplyingLanguageParams = false;
         this.visualContextSent = false;
+        this.startupAudioBuffer = [];
+        this.startupAudioBufferBytes = 0;
+        this.startupAudioBufferActive = false;
+        // Five seconds of 16 kHz mono int16 PCM. If startup takes longer,
+        // retain the most recent audio so the session begins with fresh speech.
+        this.maxStartupAudioBufferBytes = 16000 * 2 * 5;
 
         this.initElements();
         this.applyLanguageParamsToView();
@@ -905,6 +911,87 @@ class PolyTalkApp {
     }
 
     /**
+     * Start retaining audio produced before the translation socket opens.
+     */
+    beginStartupAudioBuffering() {
+        this.startupAudioBuffer = [];
+        this.startupAudioBufferBytes = 0;
+        this.startupAudioBufferActive = true;
+    }
+
+    /**
+     * Discard startup audio and prevent further pre-connection buffering.
+     */
+    clearStartupAudioBuffer() {
+        this.startupAudioBuffer = [];
+        this.startupAudioBufferBytes = 0;
+        this.startupAudioBufferActive = false;
+    }
+
+    /**
+     * Keep a bounded FIFO of PCM chunks produced while the socket connects.
+     * @param {ArrayBuffer} chunk - Raw mono int16 PCM audio.
+     */
+    bufferStartupAudioChunk(chunk) {
+        if (!this.startupAudioBufferActive || !chunk?.byteLength) {
+            return;
+        }
+
+        let bufferedChunk = chunk;
+        if (bufferedChunk.byteLength > this.maxStartupAudioBufferBytes) {
+            bufferedChunk = bufferedChunk.slice(
+                bufferedChunk.byteLength - this.maxStartupAudioBufferBytes
+            );
+        }
+
+        while (
+            this.startupAudioBuffer.length > 0 &&
+            this.startupAudioBufferBytes + bufferedChunk.byteLength >
+                this.maxStartupAudioBufferBytes
+        ) {
+            const removedChunk = this.startupAudioBuffer.shift();
+            this.startupAudioBufferBytes -= removedChunk.byteLength;
+        }
+
+        this.startupAudioBuffer.push(bufferedChunk);
+        this.startupAudioBufferBytes += bufferedChunk.byteLength;
+    }
+
+    /**
+     * Send audio immediately when connected, otherwise retain startup audio.
+     * @param {ArrayBuffer} chunk - Raw mono int16 PCM audio.
+     */
+    sendOrBufferAudioChunk(chunk) {
+        if (this.isPaused) {
+            return;
+        }
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            this.flushStartupAudioBuffer();
+            this.ws.send(chunk);
+            return;
+        }
+        this.bufferStartupAudioChunk(chunk);
+    }
+
+    /**
+     * Flush retained startup audio in capture order once the socket is open.
+     */
+    flushStartupAudioBuffer() {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            return;
+        }
+
+        const bufferedChunks = this.startupAudioBuffer;
+        this.startupAudioBuffer = [];
+        this.startupAudioBufferBytes = 0;
+        this.startupAudioBufferActive = false;
+
+        for (const chunk of bufferedChunks) {
+            this.ws.send(chunk);
+        }
+    }
+
+    /**
      * Start live translation with microphone
      */
     async startLiveTranslation(translationMode = 'live') {
@@ -923,6 +1010,7 @@ class PolyTalkApp {
         this.updateReadinessStage('audio_permission', 'active', this.uiText('Requesting microphone access'));
         this.updateUIState('connecting');
         this.clearLiveResults();
+        this.beginStartupAudioBuffering();
 
         const wsUrl = this.buildTranslationWebSocketUrl(sourceLang, targetLang, translationMode);
 
@@ -930,6 +1018,7 @@ class PolyTalkApp {
         this.ws = new WebSocket(wsUrl);
 
         this.ws.onopen = () => {
+            this.flushStartupAudioBuffer();
             this.updateReadinessStage('server_connected', 'done', this.uiText('Server connected'));
         };
 
@@ -944,6 +1033,7 @@ class PolyTalkApp {
         };
 
         this.ws.onclose = () => {
+            this.clearStartupAudioBuffer();
             this.isStreaming = false;
             this.isPaused = false;
             this.updateUIState('ready');
@@ -954,9 +1044,7 @@ class PolyTalkApp {
             if (suppressSilentChunks && level <= 0.002) {
                 return;
             }
-            if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.isPaused) {
-                this.ws.send(chunk);
-            }
+            this.sendOrBufferAudioChunk(chunk);
         });
 
         if (!success) {
@@ -1228,6 +1316,7 @@ class PolyTalkApp {
      * Close WebSocket connection
      */
     closeWebSocket() {
+        this.clearStartupAudioBuffer();
         if (this.ws) {
             const ws = this.ws;
             this.ws = null;
@@ -1280,13 +1369,12 @@ class PolyTalkApp {
         this.updateUIState('connecting');
         this.clearLiveResults();
         this.visualContextSent = false;
+        this.beginStartupAudioBuffering();
 
         // First, try to get tab audio sharing - this will show the dialog
         try {
             const success = await this.audioRecorder.startTabAudio((chunk) => {
-                if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.isPaused) {
-                    this.ws.send(chunk);
-                }
+                this.sendOrBufferAudioChunk(chunk);
             });
 
             if (!success) {
@@ -1296,6 +1384,7 @@ class PolyTalkApp {
             this.showSessionNotice(this.t('js.failed_share_tab_audio', { error: error.message }), 'error');
             this.updateReadinessStage('audio_permission', 'error', this.uiText('Tab audio unavailable'));
             this.updateUIState('ready');
+            this.clearStartupAudioBuffer();
             this.audioRecorder.stop();
             return;
         }
@@ -1309,6 +1398,7 @@ class PolyTalkApp {
         this.ws = new WebSocket(wsUrl);
 
         this.ws.onopen = () => {
+            this.flushStartupAudioBuffer();
             this.updateReadinessStage('server_connected', 'done', this.uiText('Server connected'));
             this.sendInitialVisualContext();
         };
@@ -1324,6 +1414,7 @@ class PolyTalkApp {
         };
 
         this.ws.onclose = () => {
+            this.clearStartupAudioBuffer();
             this.isStreaming = false;
             this.isPaused = false;
             this.updateUIState('ready');
@@ -1399,8 +1490,10 @@ class PolyTalkApp {
      * Stop live translation
      */
     async stopRecording() {
-        if (this.isStreaming) {
+        if (this.ws) {
             this.closeWebSocket();
+        } else {
+            this.clearStartupAudioBuffer();
         }
         await this.audioRecorder.stop();
         this.isPaused = false;
