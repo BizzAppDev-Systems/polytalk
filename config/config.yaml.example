@@ -137,3 +137,4 @@ app:
   translation_flush_chars: "${TRANSLATION_FLUSH_CHARS}"
   translation_flush_seconds: "${TRANSLATION_FLUSH_SECONDS}"
   translation_flush_min_chars: "${TRANSLATION_FLUSH_MIN_CHARS}"
+  translation_cjk_char_weight: "${TRANSLATION_CJK_CHAR_WEIGHT}"

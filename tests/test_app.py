@@ -1709,6 +1709,13 @@ class TestSTTCadence:
         assert result["text"] == "hello"
         assert result["metrics"]["force_emit"] is True
 
+    def test_stt_effective_emit_length_weights_cjk_characters(self):
+        """Test CJK transcript text reaches emit thresholds sooner."""
+        stt_main = load_stt_main_module({"STT_CJK_CHAR_WEIGHT": "50"})
+
+        assert stt_main._effective_emit_length("hello") == 5
+        assert stt_main._effective_emit_length("你好世界") == 200
+
     def test_stt_transcribe_job_preserves_pause_force_emit(self):
         """Test pause-flushed jobs remain emit-eligible after inference."""
         stt_main = load_stt_main_module()

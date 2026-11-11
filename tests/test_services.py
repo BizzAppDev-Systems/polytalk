@@ -265,6 +265,11 @@ class TestTranslationPipelineService:
         assert pipeline.tts is not None
         assert hasattr(pipeline, "media_dir")
 
+    def test_effective_text_length_weights_cjk_characters(self):
+        """Test CJK text reaches flush thresholds with fewer visible chars."""
+        assert TranslationPipelineService._effective_text_length("hello", 4) == 5
+        assert TranslationPipelineService._effective_text_length("你好世界", 50) == 200
+
     def test_pipeline_service_with_custom_services(self):
         """Test pipeline service with custom service instances."""
         mock_whisper = MagicMock(spec=WhisperService)
@@ -985,6 +990,47 @@ class TestTranslationPipelineService:
                         captured_translate_kwargs["custom_instruction"]
                         == "Translate formally."
                     )
+
+    @pytest.mark.asyncio
+    async def test_process_streaming_buffer_flush_chinese_short_phrase(self):
+        """Test short Chinese phrases flush by weighted size without punctuation."""
+        pipeline = TranslationPipelineService(warm_connections=False)
+
+        async def mock_audio_gen():
+            yield b"audio_chunk"
+            yield b"__END_SIGNAL__"
+
+        async def mock_stream_transcribe(*args, **kwargs):
+            yield MagicMock(
+                success=True,
+                text="朋友们下午好",
+                language="zh",
+                is_partial=True,
+                metrics={},
+            )
+
+        mock_translate = AsyncMock(
+            return_value=MagicMock(success=True, text="hello world.", language="en")
+        )
+        mock_synthesize = AsyncMock(
+            return_value=MagicMock(success=True, audio_url="/tmp/test.wav")
+        )
+
+        with patch.object(
+            pipeline.whisper,
+            "stream_transcribe",
+            MagicMock(return_value=mock_stream_transcribe()),
+        ):
+            with patch.object(pipeline.translation, "translate", mock_translate):
+                with patch.object(pipeline.tts, "synthesize", mock_synthesize):
+                    results = []
+                    async for result in pipeline.process_streaming(
+                        mock_audio_gen(), "zh", "en"
+                    ):
+                        results.append(result)
+
+        assert mock_translate.await_count >= 1
+        assert any(result.get("type") == "translation" for result in results)
 
     @pytest.mark.asyncio
     async def test_process_streaming_translation_retry_on_failure(self):

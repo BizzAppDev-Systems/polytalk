@@ -283,6 +283,7 @@ The main latency knobs are:
 | `STT_EMIT_INTERVAL_SECONDS` | `4.5` | Maximum time to hold pending transcript text before emitting it. |
 | `STT_PAUSE_FLUSH_SECONDS` | `1.2` | Flush and emit the current speech window after this much trailing silence. Set `0` to disable pause flushing. |
 | `STT_LEADING_SILENCE_PREROLL_SECONDS` | `0.2` | Keep this much audio before first detected speech while discarding longer tab-share startup silence. |
+| `STT_CJK_CHAR_WEIGHT` | `50` | Weight applied to CJK characters when checking `STT_EMIT_MIN_CHARS`, so Chinese/Japanese/Korean text does not wait for Latin-sized character counts. |
 | `STT_SILENCE_RMS_THRESHOLD` | `0.003` | Skip STT for very quiet audio windows. Raise this if Whisper hallucinates while nobody is speaking. |
 | `STT_NO_SPEECH_PROB_THRESHOLD` | `0.50` | Drop faster-whisper segments classified as likely no-speech. |
 | `STT_LOG_PROB_THRESHOLD` | `-1.0` | Drop low-confidence faster-whisper segments. |
@@ -311,6 +312,7 @@ The main latency knobs are:
 | `app.translation_flush_chars` | `300` | Translate buffered text once this many characters are available. |
 | `app.translation_flush_seconds` | `5.0` | Translate buffered text after this many seconds if enough text is available. |
 | `app.translation_flush_min_chars` | `120` | Minimum text required for time-based translation flushing. |
+| `app.translation_cjk_char_weight` | `50` | Weight applied to CJK characters when checking translation flush character thresholds. |
 | `translation.model` | `qwen3-8b` | Use a model supported by your provider or self-hosted server, such as qwen3-8b, TranslateGama, or another open-source/open-weight model. |
 | `translation.max_tokens` | `240` | Maximum translation output tokens. Keep bounded for live streaming, but allow enough room for Indic-script targets and longer sentence buffers. |
 | `translation.context_enabled` | `true` | Send recent successful source/target translation pairs as read-only context for later chunks. |

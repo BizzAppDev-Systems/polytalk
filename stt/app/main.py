@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import math
+import re
 import sys
 import wave
 from array import array
@@ -64,6 +65,9 @@ IDLE_FLUSH_SECONDS = float(os.environ.get("STT_IDLE_FLUSH_SECONDS", "3.0"))
 LEADING_SILENCE_PREROLL_SECONDS = float(
     os.environ.get("STT_LEADING_SILENCE_PREROLL_SECONDS", "0.2")
 )
+# TODO: Replace this CJK-only shortcut with per-language STT cadence config
+# from env/config so emit weights and timing can be tuned for any language.
+CJK_CHAR_WEIGHT = int(os.environ.get("STT_CJK_CHAR_WEIGHT", "50"))
 PRELOAD_MODEL = os.environ.get("STT_PRELOAD_MODEL", "true").lower() == "true"
 SILENCE_RMS_THRESHOLD = float(os.environ.get("STT_SILENCE_RMS_THRESHOLD", "0.003"))
 NO_SPEECH_PROB_THRESHOLD = float(os.environ.get("STT_NO_SPEECH_PROB_THRESHOLD", "0.50"))
@@ -79,6 +83,7 @@ TEMPERATURE = float(os.environ.get("STT_TEMPERATURE", "0.0"))
 INITIAL_PROMPT = os.environ.get("STT_INITIAL_PROMPT") or None
 MAX_STREAM_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 WORD_OVERLAP_STRIP_CHARS = " \t\r\n.,!?;:…\"'()[]{}"
+CJK_CHAR_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 MAX_ADJACENT_PHRASE_REPEATS = 2
 # Keep this floor above natural short repeats so env values like 0 or 1 cannot
 # make cross-delta trimming delete ordinary repeated words.
@@ -398,6 +403,14 @@ def _get_new_transcript_text(existing_text: str, update_text: str) -> str:
             return " ".join(update_words[overlap_size:]).strip()
 
     return update
+
+
+def _effective_emit_length(text: str) -> int:
+    """Return threshold length with CJK characters weighted for live speech cadence."""
+    cjk_chars = len(CJK_CHAR_PATTERN.findall(text))
+    if cjk_chars == 0:
+        return len(text)
+    return len(text) + (cjk_chars * max(1, CJK_CHAR_WEIGHT) - cjk_chars)
 
 
 def _collapse_repeated_word_sequences(text: str) -> str:
@@ -932,7 +945,7 @@ async def stream_transcription(
                     should_emit = ordered_result.force_emit or (
                         current_emit_policy == "live"
                         and (
-                            len(pending_transcript) >= EMIT_MIN_CHARS
+                            _effective_emit_length(pending_transcript) >= EMIT_MIN_CHARS
                             or now - last_emit_time >= EMIT_INTERVAL_SECONDS
                         )
                     )
@@ -949,11 +962,12 @@ async def stream_transcription(
                                 "metrics": metrics,
                             }
                         )
-                        logger.debug(
+                        logger.info(
                             "[STT_EMIT] "
                             f"seq={metrics['sequence']} "
                             f"text_len={len(full_transcript)} "
                             f"pending_len={len(pending_transcript)} "
+                            f"pending_effective_len={_effective_emit_length(pending_transcript)} "
                             f"emit_delay={metrics['emit_delay_seconds']:.3f}s "
                             f"force_emit={ordered_result.force_emit}"
                         )

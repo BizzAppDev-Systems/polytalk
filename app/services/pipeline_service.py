@@ -213,6 +213,18 @@ class TranslationPipelineService:
             except Exception as e:
                 logger.error(f"Connection pre-warming error: {e}")
 
+    # TODO: Replace this CJK-only shortcut with per-language translation flush
+    # config from env/config so thresholds can be tuned dynamically for any language.
+    CJK_CHAR_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+    @classmethod
+    def _effective_text_length(cls, text: str, cjk_char_weight: int = 50) -> int:
+        """Return threshold length with CJK characters weighted for live speech cadence."""
+        cjk_chars = len(cls.CJK_CHAR_PATTERN.findall(text))
+        if cjk_chars == 0:
+            return len(text)
+        return len(text) + (cjk_chars * max(1, cjk_char_weight) - cjk_chars)
+
     @staticmethod
     def _normalize_transcript_text(text: str) -> str:
         """Normalize transcript whitespace for stable delta detection."""
@@ -545,6 +557,7 @@ class TranslationPipelineService:
         translation_flush_chars = int_config("translation_flush_chars", 120)
         translation_flush_seconds = float_config("translation_flush_seconds", 2.0)
         translation_flush_min_chars = int_config("translation_flush_min_chars", 40)
+        translation_cjk_char_weight = int_config("translation_cjk_char_weight", 50)
         translation_context_enabled = parse_bool_config(
             translation_config.get("context_enabled"), True
         )
@@ -1023,18 +1036,21 @@ class TranslationPipelineService:
                         translation_buffer_started_at = time.time()
 
                     is_sentence_complete = bool(
-                        re.search(r"[.!?।؟]\s*$", translation_buffer)
+                        re.search(r"[.!?。！？।؟]\s*$", translation_buffer)
                     )
                     buffer_age = time.time() - translation_buffer_started_at
 
                     # Translate on sentence boundary, size threshold, or short time-based flush.
+                    effective_buffer_len = self._effective_text_length(
+                        translation_buffer, translation_cjk_char_weight
+                    )
                     should_translate = (
                         is_sentence_complete
-                        or (is_pause_flush and len(translation_buffer) >= 3)
-                        or len(translation_buffer) >= translation_flush_chars
+                        or (is_pause_flush and effective_buffer_len >= 3)
+                        or effective_buffer_len >= translation_flush_chars
                         or (
                             buffer_age >= translation_flush_seconds
-                            and len(translation_buffer) >= translation_flush_min_chars
+                            and effective_buffer_len >= translation_flush_min_chars
                         )
                     )
 
@@ -1043,7 +1059,7 @@ class TranslationPipelineService:
                             f"Accumulating: '{translation_buffer[:50]}...' "
                             f"(complete={is_sentence_complete}, "
                             f"pause_flush={is_pause_flush}, "
-                            f"len={len(translation_buffer)})"
+                            f"len={len(translation_buffer)}, effective_len={effective_buffer_len})"
                         )
                         continue
 
