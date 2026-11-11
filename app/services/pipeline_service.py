@@ -654,6 +654,14 @@ class TranslationPipelineService:
                                     "type": "tts",
                                     "audio_url": tts_result.audio_url,
                                     "sequence": tts_seq,
+                                    # ``sequence`` remains the legacy zero-based
+                                    # playback order. ``TranslatedSentence.sequence``
+                                    # carries the translation's sequence assigned at
+                                    # enqueue time, so +1 exactly matches that
+                                    # translation message's segment identity even if
+                                    # another TTS request fails.
+                                    "segment_id": translated_sentence.sequence + 1,
+                                    "line_sequence": translated_sentence.sequence + 1,
                                 }
                             )
                             duration = getattr(tts_result, "duration", 0.0) or 0.0
@@ -678,10 +686,9 @@ class TranslationPipelineService:
                     except Exception as e:
                         logger.error(f"TTS worker: error generating TTS: {e}")
                         await result_queue.put({"type": "error", "error": str(e)})
+                    finally:
+                        tts_seq += 1
                         pending_items -= 1
-
-                    tts_seq += 1
-                    pending_items -= 1
 
             except asyncio.CancelledError:
                 logger.info(f"TTS worker: cancelled, pending={pending_items}")
@@ -870,6 +877,13 @@ class TranslationPipelineService:
                             {
                                 "type": "translation",
                                 "translated_text": full_translation,
+                                "segment_id": translation_sequence + 1,
+                                "line_sequence": translation_sequence + 1,
+                                "source_language": translation_source_lang,
+                                "target_language": target_lang,
+                                "detected_language": detected_language,
+                                "segment_transcript": remaining_text,
+                                "segment_translation": result.text,
                             }
                         )
                         await enqueue_tts(result.text, translation_sequence)
@@ -1121,6 +1135,14 @@ class TranslationPipelineService:
                                 {
                                     "type": "translation",
                                     "translated_text": full_translation,
+                                    "segment_id": translation_sequence + 1,
+                                    "line_sequence": translation_sequence + 1,
+                                    "source_language": translation_source_lang,
+                                    "target_language": target_lang,
+                                    "detected_language": detected_language,
+                                    "segment_transcript": text_to_send,
+                                    "segment_translation": result.text,
+                                    "translation_attempts": attempts_used,
                                 }
                             )
 

@@ -1161,6 +1161,58 @@ class TestTranslationPipelineService:
                         pass
 
     @pytest.mark.asyncio
+    async def test_tts_exception_decrements_pending_item_once(self, caplog):
+        """A raised TTS error must not leave the worker's drain counter negative."""
+        pipeline = TranslationPipelineService(warm_connections=False)
+        release_asr = asyncio.Event()
+        tts_error_seen = asyncio.Event()
+
+        async def mock_audio_gen():
+            yield b"audio_chunk"
+
+        async def mock_stream_transcribe(*args, **kwargs):
+            yield MagicMock(
+                success=True,
+                text="Hello world",
+                language="en",
+                is_partial=True,
+                metrics={"force_emit": True},
+            )
+            await release_asr.wait()
+
+        async def mock_translate(*args, **kwargs):
+            return MagicMock(success=True, text="translated", language="en")
+
+        async def raising_tts(*args, **kwargs):
+            raise RuntimeError("TTS test failure")
+
+        async def collect_results():
+            async for result in pipeline.process_streaming(
+                mock_audio_gen(), "en", "gu"
+            ):
+                if result.get("type") == "error" and result.get("error") == (
+                    "TTS test failure"
+                ):
+                    tts_error_seen.set()
+
+        with (
+            patch.object(
+                pipeline.whisper,
+                "stream_transcribe",
+                return_value=mock_stream_transcribe(),
+            ),
+            patch.object(pipeline.translation, "translate", mock_translate),
+            patch.object(pipeline.tts, "synthesize", raising_tts),
+        ):
+            collector = asyncio.create_task(collect_results())
+            await asyncio.wait_for(tts_error_seen.wait(), timeout=1.0)
+            collector.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(collector, timeout=2.0)
+
+        assert "TTS worker drained queue successfully" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_process_streaming_asr_complete_rewrite_no_prefix_match(self):
         """Test ASR complete rewrite when last_text not in current_text (word overlap fallback)."""
         pipeline = TranslationPipelineService(warm_connections=False)
