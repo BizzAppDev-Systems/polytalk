@@ -15,6 +15,7 @@ and all translation requests flow through to the LLM as normal.
 import json
 import logging
 import re
+import time
 from contextlib import suppress
 from functools import lru_cache
 from hashlib import sha256
@@ -25,6 +26,7 @@ import redis.asyncio as aioredis
 logger = logging.getLogger(__name__)
 
 CACHE_PREFIX = "pt:cache"
+CACHE_INDEX_KEY = "pt:cache:index"
 DEFAULT_TTL_SECONDS = 86400  # 24 hours
 HASH_LENGTH = 32
 EMPTY_HASH = sha256(b"").hexdigest()[:HASH_LENGTH]
@@ -104,6 +106,14 @@ class TranslationCache:
 
     All public methods are safe to call even when Redis is not configured or
     not reachable -- they simply return None / do nothing.
+
+    Eviction:
+      - Each entry carries a per-key TTL (``ttl_seconds``); expired entries are
+        never read and are removed from the tracked index lazily on each
+        ``set`` call.
+      - A hard cap of ``max_entries`` cached keys is enforced on every ``set``:
+        once the index cardinality would exceed the cap, the oldest entries
+        (by insertion time) are deleted to make room for the new one.
     """
 
     def __init__(
@@ -117,7 +127,14 @@ class TranslationCache:
         self._max_entries = max_entries
         self._client: aioredis.Redis | None = None
         self._connected = False
-        self._stats = {"hits": 0, "misses": 0, "sets": 0, "errors": 0, "bypasses": 0}
+        self._stats = {
+            "hits": 0,
+            "misses": 0,
+            "sets": 0,
+            "errors": 0,
+            "bypasses": 0,
+            "evictions": 0,
+        }
 
     async def connect(self) -> None:
         """Connect to Redis. Sets self._connected on success."""
@@ -229,10 +246,14 @@ class TranslationCache:
             value["translation_quality"] = translation_quality
 
         try:
+            await self._enforce_max_entries()
             await self._client.set(  # type: ignore[union-attr]
                 cache_key,
                 json.dumps(value),
                 ex=self._ttl_seconds,
+            )
+            await self._client.zadd(  # type: ignore[union-attr]
+                CACHE_INDEX_KEY, {cache_key: time.time()}
             )
             self._stats["sets"] += 1
         except Exception:
@@ -241,6 +262,33 @@ class TranslationCache:
                 "Translation cache set error",
                 exc_info=True,
             )
+
+    async def _enforce_max_entries(self) -> None:
+        """Prune the index of expired keys and evict oldest entries if over cap.
+
+        Called before every ``set`` so that a new write always leaves at most
+        ``max_entries`` cache keys tracked in ``CACHE_INDEX_KEY``. Keys whose
+        TTL has already elapsed are removed from the index first, then, if the
+        cardinality would still exceed the cap once the incoming key is added,
+        the oldest tracked keys are popped and deleted from Redis.
+        """
+        if self._max_entries <= 0:
+            return
+        client = self._client
+        if client is None:
+            return
+        # Prune index entries whose cached keys should have expired by now.
+        cutoff = time.time() - self._ttl_seconds
+        await client.zremrangebyscore(CACHE_INDEX_KEY, 0, cutoff)
+        count = await client.zcard(CACHE_INDEX_KEY)
+        to_evict = count + 1 - self._max_entries
+        if to_evict <= 0:
+            return
+        popped = await client.zpopmin(CACHE_INDEX_KEY, to_evict)
+        if popped:
+            stale_keys = [key for key, _ in popped]
+            await client.delete(*stale_keys)
+            self._stats["evictions"] += len(stale_keys)
 
     async def get_stats(self) -> dict[str, Any]:
         """Return cache statistics and Redis connection info."""
