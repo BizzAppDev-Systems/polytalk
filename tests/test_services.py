@@ -12,6 +12,7 @@ from app.services.pipeline_service import (
     _semantic_probe_is_cooling_down,
 )
 from app.services.translation_cache import (
+    CACHE_INDEX_KEY,
     EMPTY_HASH,
     TranslationCache,
     make_cache_key,
@@ -3414,6 +3415,7 @@ class TestTranslationCache:
             "sets": 0,
             "errors": 0,
             "bypasses": 0,
+            "evictions": 0,
         }
 
     @pytest.mark.asyncio
@@ -3622,6 +3624,123 @@ class TestTranslationCache:
         assert parts_empty[6] == "none"
         assert parts_none[6] == "none"
         assert key_empty == key_none
+
+
+class TestTranslationCacheMaxEntries:
+    """TranslationCache enforces the max_entries cap on every set() call."""
+
+    @staticmethod
+    def _make_cache_with_fake(max_entries: int) -> tuple[TranslationCache, dict]:
+        """Build a TranslationCache wired to a minimal in-memory fake."""
+        cache = TranslationCache(
+            "redis://localhost:6379/0",
+            ttl_seconds=3600,
+            max_entries=max_entries,
+        )
+        # backing stores for the fake
+        store: dict[str, str] = {}
+        index: dict[str, float] = {}  # cache_key -> insertion score
+
+        async def _set(key, value, ex=None):
+            store[key] = value
+
+        async def _zadd(key, mapping):
+            index.setdefault(key, {}).update(mapping)
+
+        async def _zcard(key):
+            return len(index.get(key, {}))
+
+        async def _zremrangebyscore(key, _lo, hi):
+            entries = index.get(key, {})
+            stale = [k for k, score in entries.items() if score <= hi]
+            for k in stale:
+                entries.pop(k, None)
+            return len(stale)
+
+        async def _zpopmin(key, count):
+            entries = index.get(key, {})
+            ordered = sorted(entries.items(), key=lambda kv: kv[1])[:count]
+            for k, _ in ordered:
+                entries.pop(k, None)
+            return ordered
+
+        async def _delete(*keys):
+            for k in keys:
+                store.pop(k, None)
+
+        fake = MagicMock()
+        fake.set = AsyncMock(side_effect=_set)
+        fake.zadd = AsyncMock(side_effect=_zadd)
+        fake.zcard = AsyncMock(side_effect=_zcard)
+        fake.zremrangebyscore = AsyncMock(side_effect=_zremrangebyscore)
+        fake.zpopmin = AsyncMock(side_effect=_zpopmin)
+        fake.delete = AsyncMock(side_effect=_delete)
+        cache._client = fake
+        cache._connected = True
+        return cache, {"store": store, "index": index}
+
+    @pytest.mark.asyncio
+    async def test_set_indexes_new_key(self):
+        """Each set() registers the key in the index sorted set."""
+        cache, state = self._make_cache_with_fake(max_entries=10)
+        await cache.set("en", "de", "hello", "hallo")
+        assert CACHE_INDEX_KEY in state["index"]
+        tracked = state["index"][CACHE_INDEX_KEY]
+        assert len(tracked) == 1
+        assert cache.stats["sets"] == 1
+
+    @pytest.mark.asyncio
+    async def test_set_does_not_evict_below_cap(self):
+        """Setting below the cap does not trigger eviction."""
+        cache, _ = self._make_cache_with_fake(max_entries=5)
+        for i in range(4):
+            await cache.set("en", "de", f"sentence {i}", f"satz {i}")
+        assert cache.stats["evictions"] == 0
+        assert cache.stats["sets"] == 4
+
+    @pytest.mark.asyncio
+    async def test_set_evicts_oldest_when_over_cap(self):
+        """When count reaches cap, the next set evicts the oldest entry."""
+        cache, state = self._make_cache_with_fake(max_entries=3)
+        for i in range(3):
+            await cache.set("en", "de", f"sentence {i}", f"satz {i}")
+        assert cache.stats["evictions"] == 0
+
+        # 4th set should evict the oldest entry to make room
+        await cache.set("en", "de", "sentence 3", "satz 3")
+        assert cache.stats["evictions"] == 1
+        # Only 3 entries tracked, and the oldest (sentence 0) is gone
+        tracked = state["index"][CACHE_INDEX_KEY]
+        assert len(tracked) == 3
+        tracked_keys = set(tracked.keys())
+        oldest_key = make_cache_key("en", "de", "sentence 0")
+        assert oldest_key not in tracked_keys
+
+    @pytest.mark.asyncio
+    async def test_prunes_index_of_expired_entries(self):
+        """Index entries whose keys aged past TTL are pruned on next set."""
+        cache, state = self._make_cache_with_fake(max_entries=3)
+        cache._ttl_seconds = 60
+        await cache.set("en", "de", "one", "eins")
+        # Forcibly age the entry past the TTL
+        tracked = state["index"][CACHE_INDEX_KEY]
+        only_key = next(iter(tracked))
+        tracked[only_key] = 0.0  # far in the past
+
+        await cache.set("en", "de", "two", "zwei")
+        # The stale entry should have been pruned, not evicted via max cap
+        assert cache.stats["evictions"] == 0
+        assert only_key not in tracked
+        assert len(tracked) == 1  # only the new entry remains
+
+    @pytest.mark.asyncio
+    async def test_zero_max_entries_disables_eviction(self):
+        """max_entries <= 0 disables cap enforcement (safety valve)."""
+        cache, _ = self._make_cache_with_fake(max_entries=0)
+        for i in range(5):
+            await cache.set("en", "de", f"sentence {i}", f"satz {i}")
+        assert cache.stats["evictions"] == 0
+        assert cache.stats["sets"] == 5
 
 
 class TestTranslationServiceCacheIntegration:
