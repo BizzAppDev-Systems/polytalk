@@ -123,9 +123,66 @@ class Config:
         return self._config.get("whisper", {})
 
     @property
+    def vad(self) -> dict:
+        """Get shared voice activity detection configuration."""
+        return self._config.get("vad", {})
+
+    @property
     def translation(self) -> dict:
         """Get translation AI configuration."""
         return self._config.get("translation", {})
+
+    @property
+    def redis(self) -> dict:
+        """Get Redis configuration."""
+        return self._config.get("redis", {})
+
+    @property
+    def translation_cache_enabled(self) -> bool:
+        """Get translation cache enabled setting."""
+        raw = os.environ.get("TRANSLATION_CACHE_ENABLED") or self.redis.get(
+            "translation_cache_enabled"
+        )
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"true", "1", "yes", "on"}
+        return False
+
+    @property
+    def redis_url(self) -> str | None:
+        """Get Redis URL from environment or config."""
+        return (
+            os.environ.get("REDIS_URL")
+            or self.redis.get("url")
+            or os.environ.get("TRANSLATION_REDIS_URL")
+        )
+
+    @property
+    def translation_cache_ttl_seconds(self) -> int:
+        """Get translation cache TTL in seconds."""
+        try:
+            return int(
+                os.environ.get(
+                    "TRANSLATION_CACHE_TTL_SECONDS",
+                    str(self.redis.get("translation_cache_ttl_seconds", 86400)),
+                )
+            )
+        except (TypeError, ValueError):
+            return 86400
+
+    @property
+    def translation_cache_max_entries(self) -> int:
+        """Get max cache entries."""
+        try:
+            return int(
+                os.environ.get(
+                    "TRANSLATION_CACHE_MAX_ENTRIES",
+                    str(self.redis.get("translation_cache_max_entries", 100_000)),
+                )
+            )
+        except (TypeError, ValueError):
+            return 100_000
 
     @property
     def visual_context(self) -> dict:

@@ -10,6 +10,7 @@
     <link rel="stylesheet" href="/static/css/components.css">
     <link rel="stylesheet" href="/static/css/animations.css">
     <link rel="stylesheet" href="/static/css/responsive.css">
+    <link rel="stylesheet" href="/static/css/text-translation.css">
     <script>
         window.POLYTALK_I18N = {
             locale: {{ ui_locale | tojson }},
@@ -23,7 +24,7 @@
             <div class="logo-container">
                 <img src="/static/logo.png" alt="PolyTalk Logo" class="app-logo">
             </div>
-            <p class="subtitle">Real time Live speech-to-speech translations</p>
+            <p class="subtitle">{{ t("Real time Live speech-to-speech translations") }}</p>
         </header>
 
         <main>
@@ -36,6 +37,9 @@
                     <div class="language-select-wrapper">
                         <select id="source-lang" name="source_language">
                             <option value="ar">Arabic</option>
+                            <option value="as">Assamese</option>
+                            <option value="bn">Bengali</option>
+                            <option value="brx">Bodo</option>
                             <option value="bg">Bulgarian</option>
                             <option value="zh">Chinese</option>
                             <option value="hr">Croatian</option>
@@ -55,12 +59,17 @@
                             <option value="id">Indonesian</option>
                             <option value="it">Italian</option>
                             <option value="ja">Japanese</option>
+                            <option value="kn">Kannada</option>
                             <option value="ko">Korean</option>
                             <option value="lv">Latvian</option>
                             <option value="lt">Lithuanian</option>
                             <option value="ml">Malayalam</option>
+                            <option value="mni">Manipuri</option>
+                            <option value="mr">Marathi</option>
+                            <option value="or">Odia</option>
                             <option value="pl">Polish</option>
                             <option value="pt">Portuguese</option>
+                            <option value="pa">Punjabi</option>
                             <option value="ro">Romanian</option>
                             <option value="ru">Russian</option>
                             <option value="sk">Slovak</option>
@@ -68,14 +77,12 @@
                             <option value="es">Spanish</option>
                             <option value="es_MX">Spanish (Mexico)</option>
                             <option value="sv">Swedish</option>
+                            <option value="ta">Tamil</option>
+                            <option value="te">Telugu</option>
                             <option value="tr">Turkish</option>
                             <option value="uk">Ukrainian</option>
+                            <option value="ur">Urdu</option>
                             <option value="vi">Vietnamese</option>
-                            <option value="bn" disabled>Bengali</option>
-                            <option value="kn" disabled>Kannada</option>
-                            <option value="mr" disabled>Marathi</option>
-                            <option value="ta" disabled>Tamil</option>
-                            <option value="te" disabled>Telugu</option>
                         </select>
                     </div>
                 </div>
@@ -89,6 +96,9 @@
                     <div class="language-select-wrapper">
                         <select id="target-lang" name="target_language">
                             <option value="ar">Arabic</option>
+                            <option value="as">Assamese</option>
+                            <option value="bn">Bengali</option>
+                            <option value="brx">Bodo</option>
                             <option value="bg">Bulgarian</option>
                             <option value="zh">Chinese</option>
                             <option value="hr">Croatian</option>
@@ -108,12 +118,17 @@
                             <option value="id">Indonesian</option>
                             <option value="it">Italian</option>
                             <option value="ja">Japanese</option>
+                            <option value="kn">Kannada</option>
                             <option value="ko">Korean</option>
                             <option value="lv">Latvian</option>
                             <option value="lt">Lithuanian</option>
                             <option value="ml">Malayalam</option>
+                            <option value="mni">Manipuri</option>
+                            <option value="mr">Marathi</option>
+                            <option value="or">Odia</option>
                             <option value="pl">Polish</option>
                             <option value="pt">Portuguese</option>
+                            <option value="pa">Punjabi</option>
                             <option value="ro">Romanian</option>
                             <option value="ru">Russian</option>
                             <option value="sk">Slovak</option>
@@ -121,14 +136,12 @@
                             <option value="es">Spanish</option>
                             <option value="es_MX">Spanish (Mexico)</option>
                             <option value="sv">Swedish</option>
+                            <option value="ta">Tamil</option>
+                            <option value="te">Telugu</option>
                             <option value="tr">Turkish</option>
                             <option value="uk">Ukrainian</option>
+                            <option value="ur">Urdu</option>
                             <option value="vi">Vietnamese</option>
-                            <option value="bn" disabled>Bengali</option>
-                            <option value="kn" disabled>Kannada</option>
-                            <option value="mr" disabled>Marathi</option>
-                            <option value="ta" disabled>Tamil</option>
-                            <option value="te" disabled>Telugu</option>
                         </select>
                     </div>
                 </div>
@@ -154,6 +167,79 @@
                     <span class="action-icon action-icon-tab-audio" aria-hidden="true"></span>
                     <span class="btn-text action-label">Share Tab Audio</span>
                 </button>
+                <button id="text-mode-btn" class="btn btn-text action-icon-btn" title="Text Translation" aria-label="Open text translation" aria-expanded="false" aria-controls="text-translation-card">
+                    <svg class="action-icon action-icon-text-translation" viewBox="0 0 48 48" aria-hidden="true" focusable="false">
+                        <rect x="4" y="5" width="18" height="18" rx="3"></rect>
+                        <rect x="26" y="25" width="18" height="18" rx="3"></rect>
+                        <text x="13" y="19" text-anchor="middle">A</text>
+                        <text x="35" y="39" text-anchor="middle">文</text>
+                        <path d="M24 9c5 0 9 2 12 6m0 0-1-5m1 5-5-1"></path>
+                        <path d="M24 39c-5 0-9-2-12-6m0 0 1 5m-1-5 5 1"></path>
+                    </svg>
+                </button>
+            </section>
+            <section class="text-translation-card" id="text-translation-card" aria-labelledby="text-translation-title" hidden>
+                <div class="text-translation-header">
+                    <div>
+                        <span class="text-mode-label">{{ t("Text Translation") }}</span>
+                        <h2 id="text-translation-title">{{ t("Type or paste text") }}</h2>
+                    </div>
+                    <span id="text-character-count" aria-live="polite">0 / 5000</span>
+                </div>
+                <p class="text-keyboard-help">{{ t("Use your laptop's language keyboard or input method, or paste text here. A Chinese Pinyin keyboard can convert \"ni hao\" to \"你好\".") }}</p>
+                <div class="text-translation-grid">
+                    <section class="text-entry-panel" aria-labelledby="text-source-title">
+                        <div class="text-entry-header">
+                            <label id="text-source-title" for="text-source-input">{{ t("Source text") }}</label>
+                            <button id="text-source-speak-btn" class="text-speaker-button" type="button" disabled aria-label="Listen to source text" title="Listen to source text">
+                                <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+                                    <path d="M3 8h3l4-3v10l-4-3H3V8Z" fill="#ffffff"></path>
+                                    <path d="M13 7.5a4 4 0 0 1 0 5M15 5.5a7 7 0 0 1 0 9" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round"></path>
+                                </svg>
+                            </button>
+                        </div>
+                        <textarea id="text-source-input" data-max-characters="5000" rows="7" dir="auto" lang="de" placeholder="{{ t("Enter or paste text to translate") }}"></textarea>
+                    </section>
+                    <section class="text-output-panel" aria-labelledby="text-output-title">
+                        <div class="text-output-header">
+                            <span id="text-output-title">{{ t("Translated text") }}</span>
+                            <div class="text-output-actions">
+                                <button id="text-copy-btn" type="button" disabled>{{ t("Copy") }}</button>
+                                <button id="text-speak-btn" class="text-speaker-button" type="button" disabled aria-label="Listen to translated text" title="Listen to translated text">
+                                    <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+                                        <path d="M3 8h3l4-3v10l-4-3H3V8Z" fill="#ffffff"></path>
+                                        <path d="M13 7.5a4 4 0 0 1 0 5M15 5.5a7 7 0 0 1 0 9" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round"></path>
+                                    </svg>
+                                </button>
+                            </div>
+                        </div>
+                        <div id="text-translation-output" class="text-translation-output" dir="auto" lang="en">Your translation will appear here.</div>
+                    </section>
+                </div>
+                <div class="text-audio-grid" id="text-audio-grid" hidden>
+                    <section class="text-audio-panel" id="text-source-audio-panel" aria-labelledby="text-source-audio-title" hidden>
+                        <div class="text-audio-header">
+                            <div>
+                                <span class="text-audio-kicker">{{ t("Source Voice") }}</span>
+                                <strong id="text-source-audio-title">{{ t("Source audio") }}</strong>
+                            </div>
+                        </div>
+                        <audio id="text-source-audio-player" controls preload="metadata" hidden></audio>
+                    </section>
+                    <section class="text-audio-panel" id="text-translation-audio-panel" aria-labelledby="text-translation-audio-title" hidden>
+                        <div class="text-audio-header">
+                            <div>
+                                <span class="text-audio-kicker">{{ t("Translated Voice") }}</span>
+                                <strong id="text-translation-audio-title">{{ t("Translated audio") }}</strong>
+                            </div>
+                        </div>
+                        <audio id="text-audio-player" controls preload="metadata" hidden></audio>
+                    </section>
+                </div>
+                <div class="text-translation-footer">
+                    <button id="text-translate-btn" class="btn btn-live" type="button" disabled>{{ t("Translate text") }}</button>
+                    <span id="text-translation-status" role="status" aria-live="polite"></span>
+                </div>
             </section>
             <section class="session-controls" id="session-controls" style="display: none;">
                 <button id="pause-btn" class="btn btn-tertiary" disabled aria-label="Pause live translation">
@@ -182,6 +268,23 @@
                 </span>
             </div>
 
+            <div id="session-runtime-toggles" class="session-runtime-toggles" hidden>
+                <div class="pipeline-stage-bar" id="pipeline-stage-bar" role="group" aria-label="Session pipeline mode">
+                    <button type="button" class="pipeline-stage" data-stage="transcript" aria-label="{{ t('Transcript only') }}">
+                        <svg class="pipeline-stage-icon pipeline-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+                        <span class="stage-tooltip-text">{{ t("Transcript — Shows live transcription from audio/video") }}</span>
+                    </button>
+                    <button type="button" class="pipeline-stage" data-stage="translation" aria-label="{{ t('Transcript and translation') }}">
+                        <svg class="pipeline-stage-icon pipeline-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h4"/></svg>
+                        <span class="stage-tooltip-text">{{ t("Translation — Transcribes and translates text in real-time") }}</span>
+                    </button>
+                    <button type="button" class="pipeline-stage" data-stage="translation_tts" aria-label="{{ t('Transcript, translation, and audio') }}">
+                        <svg class="pipeline-stage-icon pipeline-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 10v4"/><path d="M6 6v12"/><path d="M10 3v18"/><path d="M14 8v7"/><path d="M18 5v14"/><path d="M22 10v4"/></svg>
+                        <span class="stage-tooltip-text">{{ t("Full Pipeline — Transcribes, translates, and synthesizes audio output") }}</span>
+                    </button>
+                </div>
+            </div>
+
             <section class="live-results">
                 <div class="live-box transcript-box">
                     <h3>Live Transcript</h3>
@@ -204,6 +307,7 @@
                     Your browser does not support the audio element.
                 </audio>
             </div>
+
         </section>
 
         <div id="settings-modal" class="settings-modal">
@@ -244,6 +348,26 @@
                         <p class="settings-note">Select the device where you want to hear the translated audio.</p>
                     </div>
                     <div class="settings-section">
+                        <h3>{{ t("Default Pipeline Mode") }}</h3>
+                        <p class="settings-note">{{ t("Choose how PolyTalk processes your audio by default for each session.") }}</p>
+                        <div class="settings-field pipeline-mode-field">
+                            <div class="pipeline-mode-session-bar" id="settings-pipeline-bar" role="group" aria-label="Default pipeline mode">
+                                <button type="button" class="pipeline-mode-session-stage" data-stage="transcript" aria-label="{{ t('Transcript only') }}">
+                                    <svg class="pipeline-stage-icon pipeline-mode-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+                                    <span class="pipeline-mode-tooltip">{{ t("Transcript — Shows live transcription from audio/video") }}</span>
+                                </button>
+                                <button type="button" class="pipeline-mode-session-stage" data-stage="translation" aria-label="{{ t('Transcript and translation') }}">
+                                    <svg class="pipeline-stage-icon pipeline-mode-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h4"/></svg>
+                                    <span class="pipeline-mode-tooltip">{{ t("Translation — Transcribes and translates text in real-time") }}</span>
+                                </button>
+                                <button type="button" class="pipeline-mode-session-stage" data-stage="translation_tts" aria-label="{{ t('Transcript, translation, and audio') }}">
+                                    <svg class="pipeline-stage-icon pipeline-mode-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 10v4"/><path d="M6 6v12"/><path d="M10 3v18"/><path d="M14 8v7"/><path d="M18 5v14"/><path d="M22 10v4"/></svg>
+                                    <span class="pipeline-mode-tooltip">{{ t("Full Pipeline — Transcribes, translates, and synthesizes audio output") }}</span>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="settings-section">
                         <h3>AI Behavior</h3>
                         <div class="settings-field">
                             <label for="custom-instruction-input">Translation Instructions</label>
@@ -251,6 +375,27 @@
                             <div class="settings-char-count" id="custom-instruction-count" aria-live="polite">0/{{ custom_instruction_max_chars }}</div>
                         </div>
                         <p class="settings-note">Optional guidance sent with live, conversation, and tab-audio translation sessions.</p>
+                    </div>
+                    <div class="settings-section">
+                        <h3>Advanced Translation Pacing</h3>
+                        <div class="settings-field">
+                            <label for="translation-buffer-seconds">
+                                Context window:
+                                <strong id="translation-buffer-value"><span id="translation-buffer-value-number">{{ translation_buffer_seconds }}</span> <span id="translation-buffer-unit">seconds</span></strong>
+                            </label>
+                            <input
+                                id="translation-buffer-seconds"
+                                type="range"
+                                min="{{ translation_buffer_seconds_min }}"
+                                max="{{ translation_buffer_seconds_max }}"
+                                step="{{ translation_buffer_seconds_step }}"
+                                value="{{ translation_buffer_seconds }}"
+                                aria-describedby="translation-buffer-note"
+                            >
+                        </div>
+                        <p class="settings-note settings-warning" id="translation-buffer-note">
+                            Larger values reduce fragmented translations for slow speech, but translation and spoken audio arrive later. The live transcript remains immediate. Applies to live microphone and shared-tab sessions.
+                        </p>
                     </div>
                 </div>
                 <div class="settings-footer">
@@ -273,5 +418,6 @@
     <script src="/static/js/audio-recorder.js"></script>
     <script src="/static/js/polytalk-app.js"></script>
     <script src="/static/js/main.js"></script>
+    <script src="/static/js/text-translation.js"></script>
 </body>
 </html>

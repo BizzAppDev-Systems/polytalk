@@ -99,7 +99,8 @@
 
     .btn-live,
     .btn-share,
-    .btn-conversation {
+    .btn-conversation,
+    .btn-text.action-icon-btn {
         width: 70px;
         min-width: 70px;
         height: 56px;

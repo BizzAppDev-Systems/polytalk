@@ -21,7 +21,10 @@ nginx
   | http://127.0.0.1:9000
   v
 polytalk
-  |-- ws://stt:8000/v1/stream/transcriptions
+  |-- ws://stt:8000/v1/stream/transcriptions (faster-whisper fallback)
+  |-- ws://indicconformer-stt:8000/v1/stream/transcriptions
+  |-- ws://parakeet-stt:8000/v1/stream/transcriptions
+  |-- ws://sensevoice-stt:8000/v1/stream/transcriptions
   |-- http://tts:5000
   `-- http(s)://translation-provider/v1/chat/completions
 ```
@@ -96,6 +99,7 @@ TRANSLATION_BASE_URL=http://your-translation-service:8000
 TRANSLATION_MODEL=polytalk-translation
 TRANSLATION_API_KEY=
 TRANSLATION_MAX_TOKENS=240
+TRANSLATION_TYPED_TEXT_MAX_TOKENS=1536
 ```
 
 For GPU STT, start with:
@@ -108,6 +112,7 @@ STT_WORKERS=1
 STT_PRELOAD_MODEL=true
 STT_TRANSCRIBE_WORKERS=2
 STT_MODEL_WORKERS=2
+STT_SAMPLE_RATE=16000
 
 STT_STREAM_CHUNK_SECONDS=1.2
 STT_CHUNK_OVERLAP_SECONDS=0.25
@@ -120,6 +125,65 @@ STT_VAD_MIN_SILENCE_MS=500
 STT_VAD_SPEECH_PAD_MS=200
 STT_CONDITION_ON_PREVIOUS_TEXT=false
 STT_TEMPERATURE=0.0
+```
+
+## Conversation STT Routing Rollout
+
+`config/config.yaml` and `.env` are intentionally ignored by git. Pulling or
+merging a release therefore does not update an existing production mapping.
+Back up both files and merge the `whisper` routing keys from
+`config/config.yaml.example` before enabling the new router.
+
+The checked-in mapping is:
+
+| Provider | Languages |
+| --- | --- |
+| IndicConformer | `as`, `bn`, `brx`, `doi`, `gu`, `hi`, `kn`, `kok`, `ks`, `mai`, `ml`, `mni`, `mr`, `ne`, `or`, `pa`, `sa`, `sat`, `sd`, `ta`, `te`, `ur` |
+| SenseVoice | `zh`, `yue`, `ja`, `ko` |
+| Parakeet | `en`, `bg`, `hr`, `cs`, `da`, `nl`, `et`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `lv`, `lt`, `mt`, `pl`, `pt`, `ro`, `sk`, `sl`, `es`, `sv`, `ru`, `uk` |
+| faster-whisper conversation fallback | `ar`, `id`, `tr`, `vi` |
+
+Locale variants are normalized before lookup, including `nl_BE` to `nl` and
+`es_MX` to `es`. Keep `language_detection: true` only for workers that return an
+independently detected language code. Parakeet automatically chooses a
+transcription language, but does not return that code; it must remain `false`.
+Same-script pairs handled only by a provider without language-ID output use the
+configured source language as the phase-1 tie-breaker until the separate
+language detector is available.
+
+Use a staged rollout so an incomplete provider set cannot reject conversation
+turns:
+
+1. Back up `.env` and `config/config.yaml`. Merge the complete `whisper`
+   `conversation`, `providers`, and `routing` blocks from the example file.
+2. Set `STT_SAMPLE_RATE=16000` for the app and every STT worker. Raw PCM does
+   not carry sample-rate metadata, so these values must not differ.
+3. Accept the gated IndicConformer model terms and export `HF_TOKEN` in the
+   shell that builds its image. Configure all three provider URLs, model IDs,
+   enable flags, and the CPU/CUDA device in `.env`.
+4. Start with `STT_ROUTING_ENABLED=false`. Build/start the workers and verify
+   their loopback health endpoints before exposing routing:
+
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build \
+     stt indicconformer-stt parakeet-stt sensevoice-stt
+   curl --fail http://127.0.0.1:8000/health
+   curl --fail http://127.0.0.1:8011/health
+   curl --fail http://127.0.0.1:8012/health
+   curl --fail http://127.0.0.1:8013/health
+   ```
+
+5. Enable all configured providers and `STT_ROUTING_ENABLED=true`, then
+   recreate `polytalk`. Smoke-test at least one cross-provider pair, one
+   SenseVoice pair, one Parakeet pair, and the four faster-whisper fallback
+   languages.
+
+If any mapped worker is unavailable, disable routing and recreate only the app
+to restore the legacy faster-whisper path:
+
+```bash
+STT_ROUTING_ENABLED=false docker compose \
+  -f docker-compose.yml -f docker-compose.gpu.yml up -d --force-recreate polytalk
 ```
 
 Increase worker counts only after checking GPU memory and latency under load.
@@ -203,6 +267,8 @@ Model notes:
 
 - Keep `TRANSLATION_MAX_TOKENS` bounded for live streaming. `240` gives
   Indic-script targets more room while still limiting runaway generations.
+- `TRANSLATION_TYPED_TEXT_MAX_TOKENS` applies only to complete typed-text HTTP
+  translations. It does not change live, conversation, or shared-tab translation.
 - Qwen3 models may need Qwen-specific thinking/reasoning flags on the vLLM side.
 - TranslateGemma/Gemma 3 models require `bfloat16` and must not use Qwen
   reasoning parser flags.

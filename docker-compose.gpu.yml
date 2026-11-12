@@ -4,3 +4,34 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+  indicconformer-stt:
+    gpus: all
+    environment:
+      - STT_DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+  parakeet-stt:
+    gpus: all
+    environment:
+      - STT_DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+  sensevoice-stt:
+    gpus: all
+    environment:
+      - STT_DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+  indic-parler-tts:
+    gpus: all
+    build:
+      args:
+        INDIC_PARLER_TORCH_INDEX_URL: ${INDIC_PARLER_GPU_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}
+    environment:
+      - INDIC_PARLER_DEVICE=cuda
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility

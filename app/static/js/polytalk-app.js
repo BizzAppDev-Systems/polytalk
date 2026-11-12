@@ -6,6 +6,21 @@
  * Main application class for PolyTalk
  */
 
+const PIPELINE_MODES = Object.freeze([
+    'transcript',
+    'translation',
+    'translation_tts'
+]);
+const DEFAULT_PIPELINE_MODE = 'translation_tts';
+
+function normalizePipelineMode(value, fallback = DEFAULT_PIPELINE_MODE) {
+    return PIPELINE_MODES.includes(value) ? value : fallback;
+}
+
+function pipelineModeRank(value) {
+    return PIPELINE_MODES.indexOf(value);
+}
+
 class PolyTalkApp {
     /**
      * Main application class for PolyTalk
@@ -30,8 +45,11 @@ class PolyTalkApp {
         this.isTabAudioSupported = true;
         this.isApplyingLanguageParams = false;
         this.visualContextSent = false;
+        this.pipelineMode = DEFAULT_PIPELINE_MODE;
+        this.sessionPipelineModeValue = null;
 
         this.initElements();
+        this.loadSavedTranslationBuffer();
         this.applyLanguageParamsToView();
         this.initEventListeners();
         this.updateUIState('ready');
@@ -95,6 +113,12 @@ class PolyTalkApp {
         this.outputDeviceSelect = document.getElementById('output-device-select');
         this.customInstructionInput = document.getElementById('custom-instruction-input');
         this.customInstructionCount = document.getElementById('custom-instruction-count');
+        this.translationBufferSeconds = document.getElementById('translation-buffer-seconds');
+        this.translationBufferValueNumber = document.getElementById('translation-buffer-value-number');
+        this.settingsPipelineBar = document.getElementById('settings-pipeline-bar');
+        this.sessionPipelineModePills = document.querySelectorAll('#pipeline-stage-bar .pipeline-stage');
+        this.pipelineStageBar = document.getElementById('pipeline-stage-bar');
+        this.sessionRuntimeToggles = document.getElementById('session-runtime-toggles');
         this.status = document.getElementById('status');
         this.recordingIndicator = document.getElementById('recording-indicator');
         this.transcript = document.getElementById('transcript');
@@ -119,6 +143,7 @@ class PolyTalkApp {
             this.swapLangsBtn.title = this.uiText('Swap Languages');
         }
         if (this.sessionControls) this.sessionControls.style.display = 'none';
+        if (this.sessionRuntimeToggles) this.sessionRuntimeToggles.setAttribute('hidden', '');
     }
 
     /**
@@ -202,10 +227,51 @@ class PolyTalkApp {
                 window.setTimeout(() => this.enforceCustomInstructionMaxLength(), 0);
             });
         }
+        if (this.translationBufferSeconds) {
+            this.translationBufferSeconds.addEventListener('input', () => {
+                this.updateTranslationBufferLabel();
+                window.clearTimeout(this.translationBufferConfigTimer);
+                this.translationBufferConfigTimer = window.setTimeout(() => {
+                    if (this.ws?.readyState === WebSocket.OPEN) {
+                        this.ws.send(JSON.stringify({
+                            type: 'translation_buffer_config',
+                            translation_buffer_seconds: this.getTranslationBufferSeconds()
+                        }));
+                    }
+                }, 250);
+            });
+        }
+        if (this.settingsPipelineBar) {
+            this.settingsPipelineBar.addEventListener('click', (e) => {
+                const stage = e.target.closest('.pipeline-mode-session-stage');
+                if (stage) {
+                    const mode = normalizePipelineMode(stage.dataset.stage);
+                    this.pipelineMode = mode;
+                    localStorage.setItem('polytalk_pipeline_mode', String(mode));
+                    this._updateSettingsPipelineUI();
+                }
+            });
+            this._updateSettingsPipelineUI();
+        }
+        this.sessionPipelineModePills.forEach(pill => {
+            pill.addEventListener('click', () => {
+                const mode = normalizePipelineMode(pill.dataset.stage);
+                this.sendPipelineMode(mode);
+            });
+        });
         const saveSettingsBtn = document.getElementById('save-settings-btn');
         if (saveSettingsBtn) {
             saveSettingsBtn.addEventListener('click', () => this.saveSettings());
         }
+    }
+
+    /**
+     * Sync session pipeline mode from global preference.
+     */
+    _syncSessionPipelineState() {
+        this.sessionPipelineModeValue = null; // Use global
+        this._updatePills();
+        this.applyModeToUI();
     }
 
     /**
@@ -434,6 +500,7 @@ class PolyTalkApp {
         const inputDeviceId = this.inputDeviceSelect?.value || 'default';
         const outputDeviceId = this.outputDeviceSelect?.value || 'default';
         const customInstruction = this.getCustomInstruction();
+        const translationBufferSeconds = this.getTranslationBufferSeconds();
         if (this.customInstructionInput) {
             this.customInstructionInput.value = customInstruction;
             this.updateCustomInstructionCount();
@@ -442,6 +509,16 @@ class PolyTalkApp {
         localStorage.setItem('polytalk_input_device', inputDeviceId);
         localStorage.setItem('polytalk_output_device', outputDeviceId);
         localStorage.setItem('polytalk_custom_instruction', customInstruction);
+        localStorage.setItem(
+            'polytalk_translation_buffer_seconds',
+            String(translationBufferSeconds)
+        );
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+                type: 'translation_buffer_config',
+                translation_buffer_seconds: translationBufferSeconds
+            }));
+        }
 
         this.audioRecorder.selectedDeviceId = inputDeviceId;
         this.audioRecorder.setOutputDeviceId(outputDeviceId);
@@ -472,6 +549,12 @@ class PolyTalkApp {
             this.audioRecorder.selectedOutputDeviceId = savedOutputDevice;
             this.applyOutputDeviceToAudioPlayer(savedOutputDevice);
         }
+
+        const savedMode = localStorage.getItem('polytalk_pipeline_mode');
+        if (savedMode) {
+            this.pipelineMode = normalizePipelineMode(savedMode);
+            this._updateSettingsPipelineUI();
+        }
     }
 
     /**
@@ -482,6 +565,53 @@ class PolyTalkApp {
 
         this.customInstructionInput.value = localStorage.getItem('polytalk_custom_instruction') || '';
         this.enforceCustomInstructionMaxLength();
+    }
+
+    /**
+     * Restore the locally saved per-session translation context window.
+     */
+    loadSavedTranslationBuffer() {
+        if (!this.translationBufferSeconds) return;
+
+        const savedValue = localStorage.getItem('polytalk_translation_buffer_seconds');
+        if (savedValue !== null) {
+            this.translationBufferSeconds.value = String(
+                this.clampTranslationBufferSeconds(savedValue)
+            );
+        }
+        this.updateTranslationBufferLabel();
+    }
+
+    /**
+     * Bound translation pacing using the limits rendered by the server.
+     */
+    clampTranslationBufferSeconds(value) {
+        const minimum = Number(this.translationBufferSeconds?.min || 1);
+        const maximum = Number(this.translationBufferSeconds?.max || 10);
+        const seconds = Number(value);
+        if (!Number.isFinite(seconds)) {
+            return Number(this.translationBufferSeconds?.value || minimum);
+        }
+        return Math.min(maximum, Math.max(minimum, seconds));
+    }
+
+    /**
+     * Return the translation context window selected for the next session.
+     */
+    getTranslationBufferSeconds() {
+        return this.clampTranslationBufferSeconds(
+            this.translationBufferSeconds?.value
+        );
+    }
+
+    /**
+     * Keep the visible slider value in sync with the range input.
+     */
+    updateTranslationBufferLabel() {
+        if (!this.translationBufferValueNumber) return;
+
+        const seconds = this.getTranslationBufferSeconds();
+        this.translationBufferValueNumber.textContent = seconds.toFixed(1);
     }
 
     /**
@@ -571,8 +701,121 @@ class PolyTalkApp {
         if (customInstruction) {
             params.set('custom_instruction', customInstruction);
         }
+        if (mode !== 'conversation') {
+            params.set(
+                'translation_buffer_seconds',
+                String(this.getTranslationBufferSeconds())
+            );
+        }
+        if (this.sessionStartMode === 'tab') {
+            params.set('input_type', 'share');
+        }
+        params.set(
+            'pipeline_mode',
+            String(this.getEffectivePipelineMode())
+        );
 
         return `${protocol}//${window.location.host}/api/ws/translate?${params.toString()}`;
+    }
+
+    /**
+     * Send pipeline mode to backend and update UI.
+     * @param {string} mode - transcript, translation, or translation_tts
+     */
+    sendPipelineMode(mode) {
+        this.sessionPipelineModeValue = mode;
+        if (mode !== 'translation_tts' && (this.ttsQueue.length > 0 || this.isPlayingTTS)) {
+            while (this.ttsQueue.length > 0) {
+                const drainedItem = this.ttsQueue.shift();
+                this.cleanupTTSPreload(drainedItem?.audio);
+            }
+            this.ttsQueue = [];
+            this.isPlayingTTS = false;
+            this.audioPlayer.pause();
+            this.audioPlayer.src = '';
+        }
+        if (this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+                type: 'pipeline_mode',
+                value: mode
+            }));
+        }
+        this.applyModeToUI();
+    }
+
+    /**
+     * Get the effective result mode for the current session.
+     * A session-level override wins over the saved global preference.
+     */
+    getEffectivePipelineMode() {
+        return this.sessionPipelineModeValue ?? this.pipelineMode;
+    }
+
+    /**
+     * Apply the current result mode to output visibility.
+     */
+    applyModeToUI() {
+        const effectiveMode = this.getEffectivePipelineMode();
+        this._updatePills();
+        if (this.liveTranslation) {
+            this.liveTranslation.closest('.translation-box').style.display =
+                effectiveMode !== 'transcript' ? '' : 'none';
+        }
+        if (this.audioContainer) {
+            this.audioContainer.style.display =
+                effectiveMode === 'translation_tts' ? '' : 'none';
+        }
+    }
+
+    /**
+     * Update pipeline stage active states.
+     * Stages are cumulative: clicking stage N activates stages 1..N.
+     */
+    _updatePills() {
+        const effectiveMode = this.getEffectivePipelineMode();
+        this.sessionPipelineModePills.forEach(pill => {
+            const stageMode = normalizePipelineMode(pill.dataset.stage);
+            const isCurrent = stageMode === effectiveMode;
+            const isPassed = pipelineModeRank(stageMode) < pipelineModeRank(effectiveMode);
+            const wasActive = pill.classList.contains('active');
+
+            pill.classList.toggle('active', isCurrent);
+            pill.classList.toggle('passed', isPassed);
+            pill.setAttribute('aria-pressed', String(isCurrent));
+            pill.classList.remove('just-activated');
+
+            if (!wasActive && isCurrent) {
+                pill.classList.add('just-activated');
+                setTimeout(() => {
+                    pill.classList.remove('just-activated');
+                }, 400);
+            }
+        });
+    }
+
+    /**
+     * Update settings pipeline mode bar active states.
+     */
+    _updateSettingsPipelineUI() {
+        if (!this.settingsPipelineBar) return;
+        this.settingsPipelineBar.querySelectorAll('.pipeline-mode-session-stage').forEach(stage => {
+            const stageMode = normalizePipelineMode(stage.dataset.stage);
+            const isCurrent = stageMode === this.pipelineMode;
+            const isPassed = pipelineModeRank(stageMode) < pipelineModeRank(this.pipelineMode);
+            const wasActive = stage.classList.contains('active');
+
+            stage.classList.toggle('active', isCurrent);
+            stage.classList.toggle('passed', isPassed);
+            stage.setAttribute('aria-pressed', String(isCurrent));
+            stage.classList.remove('just-activated');
+
+            if (!wasActive && isCurrent) {
+                stage.classList.add('just-activated');
+                setTimeout(() => {
+                    stage.classList.remove('just-activated');
+                }, 400);
+            }
+        });
     }
 
     /**
@@ -921,8 +1164,10 @@ class PolyTalkApp {
         this.sessionStartMode = 'microphone';
         this.resetReadinessPanel(this.uiText('Requesting microphone access'));
         this.updateReadinessStage('audio_permission', 'active', this.uiText('Requesting microphone access'));
+        this.applyModeToUI();
         this.updateUIState('connecting');
         this.clearLiveResults();
+        this.stopTextTranslationAudio();
 
         const wsUrl = this.buildTranslationWebSocketUrl(sourceLang, targetLang, translationMode);
 
@@ -1047,6 +1292,17 @@ class PolyTalkApp {
             return;
         }
 
+        if (this.getEffectivePipelineMode() !== 'translation_tts') {
+            while (this.ttsQueue.length > 0) {
+                const drainedItem = this.ttsQueue.shift();
+                this.cleanupTTSPreload(drainedItem?.audio);
+            }
+            this.cleanupTTSPreload(this.currentTTSPreload);
+            this.currentTTSPreload = null;
+            this.isPlayingTTS = false;
+            return;
+        }
+
         // Sort queue by sequence number to ensure correct order
         this.ttsQueue.sort((a, b) => a.sequence - b.sequence);
 
@@ -1121,6 +1377,22 @@ class PolyTalkApp {
             this.audioPlayer.pause();
             this.audioPlayer.removeAttribute('src');
             this.audioPlayer.load();
+        }
+    }
+
+    /**
+     * Stop any playing audio from the text translation feature.
+     */
+    stopTextTranslationAudio() {
+        const textPlayer = document.getElementById('text-audio-player');
+        if (textPlayer) {
+            textPlayer.pause();
+            textPlayer.removeAttribute('src');
+            textPlayer.load();
+            textPlayer.hidden = true;
+        }
+        if (window._PolyTalkTextTranslation?.clearAudio) {
+            window._PolyTalkTextTranslation.clearAudio();
         }
     }
 
@@ -1279,7 +1551,9 @@ class PolyTalkApp {
         this.updateReadinessStage('audio_permission', 'active', this.uiText('Opening screen sharing dialog'));
         this.updateUIState('connecting');
         this.clearLiveResults();
+        this.stopTextTranslationAudio();
         this.visualContextSent = false;
+        this._syncSessionPipelineState();
 
         // First, try to get tab audio sharing - this will show the dialog
         try {
@@ -1506,6 +1780,18 @@ class PolyTalkApp {
     }
 
     /**
+     * Update session runtime toggles visibility based on UI state.
+     */
+    updateRuntimeTogglesVisibility(_state) {
+        if (!this.sessionRuntimeToggles) return;
+        if ((this.sessionStartMode === 'tab' || this.sessionStartMode === 'microphone') && this.isStreaming) {
+            this.sessionRuntimeToggles.removeAttribute('hidden');
+        } else {
+            this.sessionRuntimeToggles.setAttribute('hidden', '');
+        }
+    }
+
+    /**
      * Update UI state based on recording state
      * States: 'ready', 'connecting', 'streaming', 'paused'
      */
@@ -1519,6 +1805,7 @@ class PolyTalkApp {
                 if (this.pauseBtn) this.pauseBtn.disabled = true;
                 if (this.stopBtn) this.stopBtn.disabled = false;
                 if (this.sessionControls) this.sessionControls.style.display = 'flex';
+                this.updateRuntimeTogglesVisibility('connecting');
                 this.setRecordingIndicator(this.uiText('Preparing...'), true);
                 this.setLanguageFieldsDisabled(true);
                 break;
@@ -1531,6 +1818,7 @@ class PolyTalkApp {
                 if (this.pauseBtn) this.pauseBtn.disabled = false;
                 if (this.stopBtn) this.stopBtn.disabled = false;
                 if (this.sessionControls) this.sessionControls.style.display = 'flex';
+                this.updateRuntimeTogglesVisibility('streaming');
                 this.setRecordingIndicator(this.uiText('Listening...'), true);
                 this.setLanguageFieldsDisabled(true);
                 break;
@@ -1543,6 +1831,7 @@ class PolyTalkApp {
                 if (this.pauseBtn) this.pauseBtn.disabled = false;
                 if (this.stopBtn) this.stopBtn.disabled = false;
                 if (this.sessionControls) this.sessionControls.style.display = 'flex';
+                this.updateRuntimeTogglesVisibility('paused');
                 this.setRecordingIndicator(this.uiText('Paused'), false);
                 this.setLanguageFieldsDisabled(true);
                 break;
@@ -1555,6 +1844,7 @@ class PolyTalkApp {
                 if (this.pauseBtn) this.pauseBtn.disabled = true;
                 if (this.stopBtn) this.stopBtn.disabled = true;
                 if (this.sessionControls) this.sessionControls.style.display = 'none';
+                this.updateRuntimeTogglesVisibility('ready');
                 this.setRecordingIndicator(this.uiText('Recording'), false);
                 if (!this.preserveReadinessNotice) {
                     this.setReadinessIdle();
@@ -1572,6 +1862,7 @@ class PolyTalkApp {
                 if (this.pauseBtn) this.pauseBtn.disabled = true;
                 if (this.stopBtn) this.stopBtn.disabled = true;
                 if (this.sessionControls) this.sessionControls.style.display = 'none';
+                this.updateRuntimeTogglesVisibility('ready');
                 this.setRecordingIndicator(this.uiText('Recording'), false);
                 this.setLanguageFieldsDisabled(true);
         }
