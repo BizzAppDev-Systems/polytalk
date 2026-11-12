@@ -31,6 +31,16 @@ class PolyTalkApp {
         this.ws = null;
         this.isStreaming = false;
         this.isPaused = false;
+        // Connection state management
+        this.wsConnectionState = 'connected';
+        this.isOnline = typeof navigator !== 'undefined' && navigator.onLine;
+        this.reconnectAttempts = 0;
+        this.reconnectTimer = null;
+        this._lastSavedLang = null;
+        this._lastSavedMode = null;
+        this._reconnectMaxAttempts = 7;
+        this._reconnectBackoffMs = [2000, 4000, 8000, 12000, 15000, 15000, 15000];
+
         this._statusDebounceMs = 500;
         this._lastStatusTime = 0;
         this._statusDebounceTimer = null;
@@ -95,6 +105,15 @@ class PolyTalkApp {
         await this.checkBrowserSupport();
         this.checkMobileDevice();
         await this.loadSupportedLanguages();
+        this._initOnlineDetection();
+    }
+
+    _initOnlineDetection() {
+        if (typeof navigator === 'undefined') {
+            return;
+        }
+        window.addEventListener('online', () => this._handleBrowserOnline());
+        window.addEventListener('offline', () => this._handleBrowserOffline());
     }
 
     /**
@@ -554,6 +573,8 @@ class PolyTalkApp {
         if (saveSettingsBtn) {
             saveSettingsBtn.addEventListener('click', () => this.saveSettings());
         }
+
+        // Browser online/offline detection is handled in _initOnlineDetection()
     }
 
     /**
