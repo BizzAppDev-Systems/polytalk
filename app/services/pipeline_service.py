@@ -1046,7 +1046,7 @@ class TranslationPipelineService:
                     )
                     should_translate = (
                         is_sentence_complete
-                        or (is_pause_flush and effective_buffer_len >= 3)
+                        or (is_pause_flush and len(translation_buffer) >= 3)
                         or effective_buffer_len >= translation_flush_chars
                         or (
                             buffer_age >= translation_flush_seconds
