@@ -417,8 +417,6 @@ class TTSService(BaseTTSService):
         # Select voice dynamically from Piper TTS API
         voice = voice_override or await self._get_voice_for_language(language)
 
-        text = normalize_tts_text(text)
-
         payload = {
             "text": text,
             "voice": voice,

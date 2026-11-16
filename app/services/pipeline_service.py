@@ -16,6 +16,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Optional
+from uuid import uuid4
 
 from ..config import get_config
 from ..pipeline_modes import pipeline_mode_capabilities
@@ -119,6 +120,8 @@ class TranslatedSentence:
     text: str
     sequence: int
     queued_at: float = 0.0
+    section_id: str | None = None
+    language: str | None = None
 
 
 @dataclass
@@ -597,6 +600,7 @@ class TranslationPipelineService:
         pause_event = pause_event or asyncio.Event()
         full_transcript = ""
         turn_id = 0
+        section_run_id = str(uuid4())
         visual_context_summary = None
         custom_instruction_max_chars = get_custom_instruction_max_chars()
         current_custom_instruction = normalize_instruction(
@@ -731,6 +735,16 @@ class TranslationPipelineService:
                     trans_result.language, source_language, target_language
                 )
                 turn_id += 1
+                section = {
+                    "type": "section",
+                    "section_id": f"{section_run_id}:{turn_id}",
+                    "kind": "conversation",
+                    "source_text": text_to_translate,
+                    "source_language": turn_source,
+                    "target_language": turn_target,
+                    "status": "pending" if translation_enabled else "unavailable",
+                }
+                yield section
                 yield {
                     "type": "transcription",
                     "transcript": full_transcript,
@@ -755,27 +769,37 @@ class TranslationPipelineService:
                     }
                     continue
 
-                result = await self.translation.translate(
-                    text_to_translate,
-                    turn_source,
-                    turn_target,
-                    context=translation_context.snapshot(),
-                    visual_context=visual_context_summary,
-                    custom_instruction=current_custom_instruction,
-                    **(
-                        {"custom_translation_routing": True}
-                        if custom_translation_routing
-                        else {}
-                    ),
-                    glossary_terms=glossary_terms or None,
-                )
+                try:
+                    result = await self.translation.translate(
+                        text_to_translate,
+                        turn_source,
+                        turn_target,
+                        context=translation_context.snapshot(),
+                        visual_context=visual_context_summary,
+                        custom_instruction=current_custom_instruction,
+                        **(
+                            {"custom_translation_routing": True}
+                            if custom_translation_routing
+                            else {}
+                        ),
+                        glossary_terms=glossary_terms or None,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Conversation translation failed: type=%s", type(exc).__name__
+                    )
+                    yield {**section, "status": "failed"}
+                    yield {"type": "error", "error": "Translation failed"}
+                    continue
                 if not result.success:
+                    yield {**section, "status": "failed"}
                     yield {
                         "type": "error",
                         "error": result.error or "Translation failed",
                     }
                     continue
 
+                yield {**section, "status": "completed", "translated_text": result.text}
                 translation_confidence = _extract_translation_confidence(result)
 
                 yield {
@@ -802,6 +826,7 @@ class TranslationPipelineService:
                         "audio_url": tts_result.audio_url,
                         "sequence": turn_id,
                         "turn_id": turn_id,
+                        "section_id": section["section_id"],
                         "language": turn_target,
                     }
                 elif tts_result.error:
@@ -1035,6 +1060,7 @@ class TranslationPipelineService:
             """TTS worker task - generates speech from translated sentences."""
             tts_seq = 0
             pending_items = 0
+            cancelled = False
 
             try:
                 while True:
@@ -1042,14 +1068,8 @@ class TranslationPipelineService:
                     try:
                         item = await asyncio.wait_for(tts_queue.get(), timeout=0.5)
                     except asyncio.TimeoutError:
-                        # Timeout - check if we should exit
-                        if (
-                            stop_event.is_set()
-                            and tts_queue.empty()
-                            and pending_items == 0
-                        ):
-                            logger.info("TTS worker: timeout and stop set, exiting")
-                            break
+                        # Translation may still be flushing after input stops.
+                        # Only its sentinel proves that no more speech will arrive.
                         continue
 
                     # Poison pill - shutdown signal from translation worker
@@ -1084,7 +1104,7 @@ class TranslationPipelineService:
                     try:
                         tts_result = await self._synthesize(
                             translated_sentence.text,
-                            target_lang,
+                            translated_sentence.language or target_lang,
                             save_media=False,
                         )
 
@@ -1094,6 +1114,7 @@ class TranslationPipelineService:
                                     "type": "tts",
                                     "audio_url": tts_result.audio_url,
                                     "sequence": tts_seq,
+                                    "section_id": translated_sentence.section_id,
                                 }
                             )
                             duration = getattr(tts_result, "duration", 0.0) or 0.0
@@ -1122,16 +1143,21 @@ class TranslationPipelineService:
                             type(e).__name__,
                         )
                         await result_queue.put({"type": "error", "error": str(e)})
-                        pending_items -= 1
 
                     tts_seq += 1
                     pending_items -= 1
 
             except asyncio.CancelledError:
+                cancelled = True
                 logger.info(f"TTS worker: cancelled, pending={pending_items}")
             except Exception as e:
                 logger.error("TTS worker error: type=%s", type(e).__name__)
                 await result_queue.put({"type": "error", "error": str(e)})
+            finally:
+                # Errors must terminate the consumer too. Cancellation already
+                # owns shutdown and must not block on a full result queue.
+                if not cancelled:
+                    await result_queue.put({"type": "complete"})
 
         async def asr_worker():
             """ASR worker task - streams audio to Whisper."""
@@ -1217,8 +1243,27 @@ class TranslationPipelineService:
             last_transcribed_text = ""
             full_translation = ""
             translation_sequence = 0
+            section_run_id = str(uuid4())
+            section_number = 0
+            transcript_only_buffer = ""
+
+            async def begin_section(source: str, status: str = "pending") -> dict:
+                nonlocal section_number
+                section_number += 1
+                event = {
+                    "type": "section",
+                    "section_id": f"{section_run_id}:{section_number}",
+                    "source_text": source,
+                    "source_language": translation_source_lang,
+                    "target_language": target_lang,
+                    "status": status,
+                    "kind": "live",
+                }
+                await result_queue.put(event)
+                return event
 
             # Local buffer for this streaming session (thread-safe)
+            translation_cancelled = False
             translation_buffer = ""
             translation_buffer_started_at = None
             translation_context = TranslationContextWindow(
@@ -1303,7 +1348,11 @@ class TranslationPipelineService:
                     )
 
             async def drain_translation_enabled_updates() -> None:
-                nonlocal translation_enabled, tts_enabled
+                nonlocal \
+                    translation_enabled, \
+                    tts_enabled, \
+                    translation_buffer, \
+                    translation_buffer_started_at
                 if pipeline_mode_queue is None:
                     return
                 latest_mode = None
@@ -1316,6 +1365,10 @@ class TranslationPipelineService:
                     translation_enabled, tts_enabled = pipeline_mode_capabilities(
                         latest_mode
                     )
+                    if not translation_enabled and translation_buffer.strip():
+                        await begin_section(translation_buffer.strip(), "unavailable")
+                        translation_buffer = ""
+                        translation_buffer_started_at = None
                     if not tts_enabled and not tts_queue.empty():
                         drained_count = 0
                         while True:
@@ -1335,11 +1388,13 @@ class TranslationPipelineService:
                         f"Pipeline mode updated in live: mode={latest_mode} translation={translation_enabled} tts={tts_enabled}"
                     )
 
-            async def enqueue_tts(text: str, sequence: int) -> None:
+            async def enqueue_tts(text: str, sequence: int, section: dict) -> None:
                 await tts_queue.put(
                     TranslatedSentence(
                         text=text,
                         sequence=sequence,
+                        section_id=section["section_id"],
+                        language=section["target_language"],
                         queued_at=time.time(),
                     )
                 )
@@ -1398,6 +1453,12 @@ class TranslationPipelineService:
                     reason,
                     len(text_to_commit),
                 )
+                section = await begin_section(text_to_commit)
+                translation_buffer = retained_text
+                translation_buffer_started_at = (
+                    original_buffer_started_at if retained_text else None
+                )
+                section_finalized = False
                 try:
                     result = await self.translation.translate(
                         text_to_commit,
@@ -1414,13 +1475,18 @@ class TranslationPipelineService:
                         glossary_terms=glossary_terms or None,
                     )
                     if not result.success:
+                        await result_queue.put({**section, "status": "failed"})
                         logger.warning("Failed to flush buffer (%s)", reason)
                         return
 
-                    translation_buffer = retained_text
-                    translation_buffer_started_at = (
-                        original_buffer_started_at if retained_text else None
+                    await result_queue.put(
+                        {
+                            **section,
+                            "status": "completed",
+                            "translated_text": result.text,
+                        }
                     )
+                    section_finalized = True
                     translation_context.remember(text_to_commit, result.text)
                     full_translation = (full_translation + " " + result.text).strip()
                     translation_confidence = _extract_translation_confidence(result)
@@ -1432,7 +1498,7 @@ class TranslationPipelineService:
                         }
                     )
                     if tts_enabled:
-                        await enqueue_tts(result.text, translation_sequence)
+                        await enqueue_tts(result.text, translation_sequence, section)
                         translation_sequence += 1
                     else:
                         logger.debug(
@@ -1440,6 +1506,8 @@ class TranslationPipelineService:
                             f"{translation_sequence}: tts_enabled=False"
                         )
                 except Exception as exc:
+                    if not section_finalized:
+                        await result_queue.put({**section, "status": "failed"})
                     logger.error(
                         "Failed to flush buffer (%s): %s",
                         reason,
@@ -1548,7 +1616,6 @@ class TranslationPipelineService:
                             "Translation worker: ASR done, finishing translations"
                         )
                         await flush_translation_buffer("asr done")
-                        await tts_queue.put(None)
                         break
 
                     if msg["type"] == "error":
@@ -1647,14 +1714,19 @@ class TranslationPipelineService:
                         len(text_to_translate),
                     )
 
-                    # Skip if text too short (reduced threshold)
-                    if len(text_to_translate.strip()) < 3:
-                        logger.debug(
-                            "Skipping short transcript delta: language=%s chars=%d",
-                            detected_language,
-                            len(text_to_translate),
-                        )
+                    if not translation_enabled:
+                        transcript_only_buffer = (
+                            transcript_only_buffer + " " + text_to_translate
+                        ).strip()
+                        if not trans_result.is_partial or re.search(
+                            r"[.!?।؟]\s*$", transcript_only_buffer
+                        ):
+                            await begin_section(transcript_only_buffer, "unavailable")
+                            transcript_only_buffer = ""
                         continue
+                    if transcript_only_buffer:
+                        await begin_section(transcript_only_buffer, "unavailable")
+                        transcript_only_buffer = ""
 
                     elapsed = time.time() - pipeline_start_time
                     logger.debug(
@@ -1666,13 +1738,6 @@ class TranslationPipelineService:
                     )
 
                     # Buffer short deltas to avoid low-context translations and TTS chatter.
-                    if not translation_enabled:
-                        logger.debug(
-                            "Skipping translation buffer accumulation: "
-                            "translation_enabled=False, discarding delta"
-                        )
-                        continue
-
                     cleaned_text = " ".join(text_to_translate.strip().split())
                     translation_buffer += " " + cleaned_text
                     translation_buffer = translation_buffer.strip()
@@ -1752,6 +1817,7 @@ class TranslationPipelineService:
                     try:
                         max_retries = 3
                         result = None
+                        section = await begin_section(text_to_send)
                         translation_started_at = time.time()
                         attempts_used = 0
                         for attempt in range(max_retries):
@@ -1811,6 +1877,17 @@ class TranslationPipelineService:
                             f"Translation result: success={result.success}, text_len={len(result.text) if result.text else 0}"
                         )
 
+                        await result_queue.put(
+                            {
+                                **section,
+                                "status": "completed" if result.success else "failed",
+                                **(
+                                    {"translated_text": result.text}
+                                    if result.success
+                                    else {}
+                                ),
+                            }
+                        )
                         if result.success:
                             translation_context.remember(text_to_send, result.text)
                             # Update full translation
@@ -1832,7 +1909,9 @@ class TranslationPipelineService:
 
                             # Push to TTS queue immediately for parallel processing
                             if tts_enabled:
-                                await enqueue_tts(result.text, translation_sequence)
+                                await enqueue_tts(
+                                    result.text, translation_sequence, section
+                                )
                                 translation_sequence += 1
                             else:
                                 logger.debug(
@@ -1858,11 +1937,13 @@ class TranslationPipelineService:
                         await flush_translation_buffer("final transcript")
                         break
 
+                if transcript_only_buffer:
+                    await begin_section(transcript_only_buffer, "unavailable")
                 translation_context.clear()
-                await result_queue.put({"type": "complete"})
 
             except asyncio.CancelledError:
                 translation_context.clear()
+                translation_cancelled = True
                 logger.info("Translation worker: cancelled")
             except Exception as e:
                 translation_context.clear()
@@ -1871,6 +1952,18 @@ class TranslationPipelineService:
                     type(e).__name__,
                 )
                 await result_queue.put({"type": "error", "error": str(e)})
+
+            finally:
+                if translation_cancelled:
+                    # The consumer owns timeout/cancellation after disconnect.
+                    # Never wait for queue capacity while it awaits this task.
+                    try:
+                        tts_queue.put_nowait(None)
+                    except asyncio.QueueFull:
+                        logger.debug("TTS queue full during translation cancellation")
+                else:
+                    # Normal completion must preserve queued speech and its sentinel.
+                    await tts_queue.put(None)
 
         # Start worker tasks
         asr_task = asyncio.create_task(asr_worker())
@@ -1901,7 +1994,7 @@ class TranslationPipelineService:
                         "is_partial": trans_result.is_partial,
                         "success": True,
                     }
-                elif result.get("type") in ["translation", "tts", "error"]:
+                elif result.get("type") in ["translation", "tts", "error", "section"]:
                     logger.debug(
                         "Yielding pipeline result: type=%s",
                         result.get("type"),
