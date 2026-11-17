@@ -132,25 +132,14 @@
         });
     }
 
-    // Intl.Segmenter is used to count / slice user input by grapheme cluster so
-    // a single emoji or combining sequence isn't truncated mid-codepoint. It's
-    // unavailable in older browsers (e.g. Safari < 14.1, iOS Safari < 14.5),
-    // so fall back to UTF-16 code unit length rather than throwing and killing
-    // the whole IIFE.
-    // --- polytalk-grapheme-helpers-start ---
-    const segmenter = typeof Intl.Segmenter !== 'undefined'
-        ? new Intl.Segmenter(undefined, { granularity: 'grapheme' })
-        : null;
+    const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
     function countGraphemes(str) {
-        if (segmenter === null) return str.length;
         return [...segmenter.segment(str)].length;
     }
     function sliceGraphemes(str, max) {
-        if (segmenter === null) return str.slice(0, max);
         const segments = [...segmenter.segment(str)];
         return segments.slice(0, max).map(s => s.segment).join('');
     }
-    // --- polytalk-grapheme-helpers-end ---
 
     input.addEventListener('input', () => {
         const characters = countGraphemes(input.value);
@@ -168,6 +157,12 @@
 
     sourceLanguage.addEventListener('change', syncLanguages);
     targetLanguage.addEventListener('change', syncLanguages);
+    document.getElementById('swap-langs-btn')?.addEventListener('click', () => {
+        const previousSource = sourceLanguage.value;
+        sourceLanguage.value = targetLanguage.value;
+        targetLanguage.value = previousSource;
+        syncLanguages();
+    });
 
     translateButton.addEventListener('click', async () => {
         const currentSourceText = input.value.trim();
